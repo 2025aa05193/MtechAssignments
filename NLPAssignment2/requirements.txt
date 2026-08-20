@@ -1,0 +1,6 @@
+# Text-to-SQL assignment
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7      # loss curves
+streamlit>=1.30      # web application
