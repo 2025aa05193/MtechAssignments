@@ -19,6 +19,7 @@ modelling logic of its own, only the interface and the execution layer.
 
 from __future__ import annotations
 
+import glob
 import io
 import os
 import re
@@ -35,9 +36,40 @@ from text2sql import (SOS_ID, UNK_ID, EOS_ID, Vocab, beam_decode,
 
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # The WikiSQL-trained model always emits this table name (see the placeholder
 # discussion in the adapter); we register the uploaded CSV under it.
 MODEL_TABLE = "table"
+
+
+def resolve_ckpt(path: str) -> str | None:
+    """
+    Find a checkpoint whether the path is absolute, relative to the current
+    working directory, or relative to app.py.
+
+    `streamlit run` resolves relative paths against the directory you LAUNCHED
+    from, not the directory app.py lives in. That is why a checkpoint that
+    plainly exists shows up as "not found" - the app was started from somewhere
+    else. Checking APP_DIR too removes the trap.
+    """
+    if not path:
+        return None
+    for cand in (path, os.path.join(os.getcwd(), path),
+                 os.path.join(APP_DIR, path)):
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def discover_ckpts() -> list[str]:
+    """Every *.pt under runs/ in either the launch dir or the app dir."""
+    found = []
+    for root in {os.getcwd(), APP_DIR}:
+        for pat in ("runs/*/*.pt", "*.pt", "runs/*.pt"):
+            found += glob.glob(os.path.join(root, pat))
+    return sorted({os.path.abspath(f) for f in found})
 
 
 # ==========================================================================
@@ -101,6 +133,42 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_NUM_UNIT = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*[a-zA-Z/%]+\s*$")
+
+
+def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
+    """
+    Convert text columns like '26.6 kmpl', '998 CC', '58.16 bhp' into numbers.
+
+    Real CSVs store measurements as strings with the unit attached. SQLite
+    coerces a leading number for AVG/SUM, so those happen to work - but
+    ORDER BY, MIN/MAX and comparisons fall back to LEXICOGRAPHIC ordering and
+    return confidently WRONG answers with no error at all. Measured on
+    used_cars_data.csv:
+
+        MAX("engine")                 raw '999 CC'   vs   converted 5998
+        ORDER BY "mileage" DESC       raw '9.9 kmpl' vs   converted 33.54
+        COUNT(*) WHERE "mileage" > 25 raw 568        vs   converted 494
+
+    A silent wrong number is worse than a crash, so columns are converted when
+    at least `min_ratio` of their non-null values match number-plus-unit.
+    """
+    df, converted = df.copy(), []
+    for col in df.columns:
+        if df[col].dtype.kind in "ifb":
+            continue
+        vals = df[col].dropna().astype(str)
+        if len(vals) == 0:
+            continue
+        hits = vals.str.match(_NUM_UNIT)
+        if hits.mean() >= min_ratio:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.extract(_NUM_UNIT, expand=False),
+                errors="coerce")
+            converted.append(col)
+    return df, converted
+
+
 def quote_table_refs(sql: str, table_name: str = MODEL_TABLE) -> str:
     """
     `table` is a RESERVED WORD in SQL, so the bare `FROM table` that the
@@ -142,7 +210,17 @@ st.caption("Ask a question in plain English. The model reads your table's schema
 
 with st.sidebar:
     st.header("Model")
-    ckpt = st.text_input("Checkpoint path", value="runs/seq2seq_copy/best.pt")
+    found = discover_ckpts()
+    if found:
+        labels = [os.path.relpath(f, os.getcwd()) if f.startswith(os.getcwd())
+                  else f for f in found]
+        pick = st.selectbox("Detected checkpoints", labels + ["Other path…"])
+        ckpt_raw = (st.text_input("Checkpoint path",
+                                  value="runs/seq2seq_copy/best.pt")
+                    if pick == "Other path…" else found[labels.index(pick)])
+    else:
+        ckpt_raw = st.text_input("Checkpoint path",
+                                 value="runs/seq2seq_copy/best.pt")
     device = st.selectbox("Device", ["cpu", "cuda"] if torch.cuda.is_available()
                           else ["cpu"])
     st.divider()
@@ -152,9 +230,14 @@ with st.sidebar:
     max_len = st.slider("Max SQL length (tokens)", 10, 80, 45)
     st.divider()
     auto_exec = st.checkbox("Execute query automatically", value=True)
+    clean_units = st.checkbox("Strip units from numeric-looking text columns",
+                              value=True,
+                              help="Turns '26.6 kmpl' into 26.6 so AVG/MIN/MAX "
+                                   "work on those columns.")
 
+ckpt = resolve_ckpt(ckpt_raw)
 model = None
-if os.path.exists(ckpt):
+if ckpt:
     try:
         model, src_vocab, tgt_vocab, cfg = get_model(ckpt, device)
         with st.sidebar:
@@ -165,8 +248,16 @@ if os.path.exists(ckpt):
     except Exception as e:
         st.sidebar.error(f"Could not load checkpoint: {e}")
 else:
-    st.sidebar.warning("No checkpoint found. Train one first:\n\n"
-                       "`python text2sql.py train --wikisql WikiSQL/data`")
+    with st.sidebar:
+        st.warning("No checkpoint found at that path.")
+        st.caption("Relative paths are resolved from the directory you ran "
+                   "`streamlit run` in — not from app.py.")
+        st.code(f"looked for : {ckpt_raw}\n"
+                f"working dir: {os.getcwd()}\n"
+                f"app dir    : {APP_DIR}", language="text")
+        st.caption("Fix: paste the **absolute** path above, or `cd` into the "
+                   "project folder before launching. Train one with "
+                   "`python text2sql.py train --wikisql WikiSQL/data`.")
 
 # --------------------------------------------------------------------------
 # 1. Schema
@@ -182,10 +273,18 @@ if mode == "Upload a CSV":
     if up is not None:
         try:
             df = normalise_columns(pd.read_csv(up))
+            converted = []
+            if clean_units:
+                df, converted = strip_units(df)
             columns = list(df.columns)
             table_name = re.sub(r"\W+", "_", os.path.splitext(up.name)[0]).lower()
             st.success(f"Read **{len(df):,} rows × {len(columns)} columns** "
                        f"from `{up.name}`")
+            if converted:
+                st.info("Converted to numeric by stripping units: "
+                        + ", ".join(f"`{c}`" for c in converted)
+                        + " — without this, ORDER BY and MIN/MAX on these "
+                          "columns sort as text and give wrong answers.")
             c1, c2 = st.columns([2, 1])
             with c1:
                 st.dataframe(df.head(8), width='stretch')
