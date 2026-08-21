@@ -12,7 +12,7 @@
   "dropout": 0.3,
   "use_copy": true,
   "batch_size": 64,
-  "epochs": 1,
+  "epochs": 15,
   "lr": 0.001,
   "weight_decay": 0.0,
   "grad_clip": 5.0,
@@ -22,10 +22,10 @@
   "lr_factor": 0.5,
   "early_stop_patience": 3,
   "seed": 42,
-  "device": "cpu",
+  "device": "cuda",
   "run_name": "seq2seq_copy",
   "notes": "",
-  "param_count": 9311681,
-  "src_vocab_size": 920,
-  "tgt_vocab_size": 448
+  "param_count": 41631385,
+  "src_vocab_size": 25248,
+  "tgt_vocab_size": 15000
 }
