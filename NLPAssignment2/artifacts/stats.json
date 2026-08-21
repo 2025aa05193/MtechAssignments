@@ -1,0 +1,28 @@
+{
+  "source": "WikiSQL",
+  "n_pairs": 80654,
+  "n_unique_sql": 76872,
+  "n_tables": 1,
+  "n_templates": 28,
+  "splits": {
+    "train": 56355,
+    "val": 8421,
+    "test": 15878
+  },
+  "src_vocab_size": 25248,
+  "tgt_vocab_size": 15000,
+  "src_len": {
+    "mean": 31.718687231879386,
+    "max": 122,
+    "p99_5": 57
+  },
+  "tgt_len": {
+    "mean": 21.00977012919384,
+    "max": 89,
+    "p99_5": 40
+  },
+  "pad_id": 0,
+  "unk_id": 1,
+  "sos_id": 2,
+  "eos_id": 3
+}
