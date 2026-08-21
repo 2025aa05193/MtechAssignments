@@ -251,10 +251,24 @@ def detokenize_sql(tokens: List[str]) -> str:
 # --------------------------------------------------------------------------
 
 def serialize_schema(table: str, columns: List[str]) -> List[str]:
-    """<sep> <tab> table_name <col> c1 <col> c2 ..."""
+    """
+    <sep> <tab> table_name <col> c1_word1 c1_word2 <col> c2_word1 ...
+
+    Column names are split into WORD tokens with the same whitespace rule used
+    for quoted spans in the target (tokenize_value). This alignment is not
+    cosmetic - it is what makes schema linking possible at all.
+
+    If the source kept a column as one token ('school/club team') while the
+    target emitted two ('school/club', 'team'), the two sides would share no
+    vocabulary items, the copy mechanism could never point at a column name,
+    and unseen columns would be <unk> on the source side. WikiSQL holds out
+    100% of test tables, so almost every column at test time is unseen - which
+    makes this the difference between generalising and guessing.
+    """
     toks = [SEP, TAB, table.lower()]
     for c in columns:
-        toks += [COL, c.lower()]
+        toks.append(COL)
+        toks.extend(tokenize_value(str(c)) or ["unnamed"])
     return toks
 
 

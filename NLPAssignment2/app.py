@@ -126,10 +126,19 @@ def _greedy_with_attention(model, src_ids, src_ext_ids, n_oov, max_len, device):
 # Execution layer
 # ==========================================================================
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Match the preprocessing: column names are lowercased and whitespace
-    collapsed, so the SQL the model generates lines up with the real table."""
+    """
+    Make CSV headers look like the schema the model was trained on.
+
+    WikiSQL headers are natural language with SPACES ("years in toronto",
+    "school/club team"). CSV headers are usually snake_case
+    ("Kilometers_Driven"). Fed in raw, `kilometers_driven` is a single unseen
+    token, so the model cannot link it to the words "kilometers" and "driven"
+    in the question - it emits a fragment and invents a WHERE clause.
+    Underscores therefore become spaces, matching training.
+    """
     df = df.copy()
-    df.columns = [re.sub(r"\s+", " ", str(c)).strip().lower() for c in df.columns]
+    df.columns = [re.sub(r"\s+", " ", str(c).replace("_", " ")).strip().lower()
+                  for c in df.columns]
     return df
 
 
@@ -300,7 +309,8 @@ else:
     table_name = st.text_input("Table name", value="employees")
     raw = st.text_input("Columns (comma-separated)",
                         value="employee_id, name, department, salary, hire_date")
-    columns = [c.strip().lower() for c in raw.split(",") if c.strip()]
+    columns = [re.sub(r"\s+", " ", c.replace("_", " ")).strip().lower()
+               for c in raw.split(",") if c.strip()]
     if columns:
         st.caption(f"{len(columns)} columns: " + ", ".join(f"`{c}`" for c in columns))
 
