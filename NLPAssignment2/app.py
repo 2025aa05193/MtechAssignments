@@ -32,7 +32,8 @@ import torch
 
 from text2sql import (SOS_ID, UNK_ID, EOS_ID, Vocab, beam_decode,
                       build_extended, build_source_sequence, detokenize_sql,
-                      greedy_decode, load_checkpoint, outputids_to_tokens)
+                      greedy_decode, load_checkpoint, outputids_to_tokens,
+                      quote_table_refs)
 
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
 
@@ -176,18 +177,6 @@ def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
                 errors="coerce")
             converted.append(col)
     return df, converted
-
-
-def quote_table_refs(sql: str, table_name: str = MODEL_TABLE) -> str:
-    """
-    `table` is a RESERVED WORD in SQL, so the bare `FROM table` that the
-    WikiSQL-trained model emits is a syntax error in SQLite. Quoting the
-    identifier makes it legal. Without this, every generated query fails to
-    execute no matter how good the model is.
-    """
-    return re.sub(rf'(?<![\w."])(FROM|JOIN|INTO|UPDATE)\s+{re.escape(table_name)}'
-                  r'(?![\w."])',
-                  lambda m: f'{m.group(1)} "{table_name}"', sql, flags=re.I)
 
 
 def run_sql(df: pd.DataFrame, sql: str, table_name: str = MODEL_TABLE):
