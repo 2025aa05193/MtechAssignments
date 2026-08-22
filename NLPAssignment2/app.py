@@ -320,6 +320,73 @@ def count_star_repair(sql: str, question: str, df: pd.DataFrame):
     return sql[:m.start()] + "COUNT(*)" + sql[m.end():], col
 
 
+_COND_RE = re.compile(r'"([^"]+)"\s*(>=|<=|<>|!=|=|>|<)\s*(\'[^\']*\'|-?\d+(?:\.\d+)?)')
+
+
+def _column_of(df: pd.DataFrame, name: str):
+    for c in df.columns:
+        if str(c).lower() == name.lower():
+            return df[c]
+    return None
+
+
+def unsatisfiable_conditions(sql: str, df: pd.DataFrame,
+                             max_candidates: int = 2000) -> list:
+    """
+    Find WHERE conditions that provably match ZERO rows of the uploaded table.
+
+    The decoder sometimes appends a WHERE clause the question never asked for -
+    "What is the average kilometers a car has driven?" yields
+    `... WHERE "year" = 'driven'`. `year` holds integers, so that condition can
+    never be true, the query returns no rows, and AVG comes back NULL.
+
+    Only two cases count as PROVABLY unsatisfiable, both cheap and certain:
+      * a non-numeric literal compared against a numeric column
+      * an equality against a low-cardinality text column whose values do not
+        include the literal (checked case-insensitively, after grounding has
+        already had its chance to fix it)
+
+    High-cardinality / free-text columns are never judged, because absence
+    there is ordinary rather than evidence of a hallucinated clause.
+    """
+    out = []
+    for m in _COND_RE.finditer(sql):
+        col, op, raw = m.group(1), m.group(2), m.group(3)
+        series = _column_of(df, col)
+        if series is None:
+            continue
+        literal = raw[1:-1] if raw.startswith("'") else raw
+        is_num_literal = re.fullmatch(r"-?\d+(?:\.\d+)?", literal) is not None
+
+        if series.dtype.kind in "if":
+            if not is_num_literal:
+                out.append((m.group(0), f'"{col}" is numeric but the value '
+                                        f"'{literal}' is not a number"))
+            continue
+        if op != "=":
+            continue
+        uniq = series.dropna().astype(str).unique()
+        if len(uniq) == 0 or len(uniq) > max_candidates:
+            continue                      # free text: absence proves nothing
+        if literal.lower() not in {u.lower() for u in uniq}:
+            out.append((m.group(0), f"'{literal}' does not occur in "
+                                    f'"{col}" ({len(uniq)} distinct values)'))
+    return out
+
+
+def drop_conditions(sql: str, conditions) -> str:
+    """Remove the given condition strings, tidying up AND / WHERE around them."""
+    s = sql
+    for cond, _ in conditions:
+        s = s.replace(cond, "\x00")
+    s = re.sub(r"\s*\x00\s*AND\s+", " ", s)
+    s = re.sub(r"\s+AND\s*\x00\s*", " ", s)
+    s = re.sub(r"\bWHERE\s*\x00\s*", "", s)
+    s = s.replace("\x00", "")
+    s = re.sub(r"\bWHERE\s*(?=(GROUP|ORDER|LIMIT|HAVING)\b|$)", "", s, flags=re.I)
+    return " ".join(s.split()).strip()
+
+
 def _sqlite_type(dtype) -> str:
     k = getattr(dtype, "kind", "O")
     if k in "iu":
@@ -412,6 +479,11 @@ with st.sidebar:
                               "WHERE \"city\" = 'mumbai' matches 'Mumbai'. "
                               "The model lowercases everything, so without "
                               "this most WHERE clauses return zero rows.")
+    drop_unsat = st.checkbox("Drop impossible WHERE conditions", value=True,
+                             help="Removes a condition that provably matches "
+                                  "zero rows (e.g. a text value compared "
+                                  "against a numeric column). Changes the "
+                                  "query's meaning, so it is always reported.")
     ground = st.checkbox("Ground values against the table", value=True,
                          help="Snaps a WHERE value onto a value that actually "
                               "exists in that column, fixing over-copying like "
@@ -537,6 +609,13 @@ if go:
             sql, subs = ground_values(sql, df)
             notes += [f"value `{a}` -> `{b}` (real value in `{c}`)"
                       for a, b, c in subs]
+        if drop_unsat:
+            bad = unsatisfiable_conditions(sql, df)
+            if bad:
+                sql = drop_conditions(sql, bad)
+                st.session_state["dropped"] = bad
+            else:
+                st.session_state["dropped"] = []
         if count_star:
             sql, replaced = count_star_repair(sql, question, df)
             if replaced:
@@ -555,6 +634,10 @@ if "sql" in st.session_state:
     st.code(st.session_state["sql"], language="sql")
     for note in st.session_state.get("post", []):
         st.caption("🔧 post-processing: " + note)
+    for cond, why in st.session_state.get("dropped", []):
+        st.warning(f"Removed `{cond}` — {why}. This condition matched no rows, "
+                   "so the query would have returned nothing. **It changes what "
+                   "the query asks**; use Reset below if it was intended.")
 
     with st.expander("How the model read your input"):
         st.write("**Encoder input** (question + serialised schema)")
