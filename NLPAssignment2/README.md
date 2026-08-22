@@ -1,3 +1,5 @@
+#### Link to Streamlit App-  https://nlpassignment2g250.streamlit.app/
+
 # Text-to-SQL Application
 
 A natural-language interface for querying CSV-based tabular data. Users upload a CSV file, ask a question in plain English, and the system generates SQL that can be reviewed, edited, and executed against the uploaded data.
