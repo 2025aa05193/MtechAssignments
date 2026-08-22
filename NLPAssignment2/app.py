@@ -1,20 +1,21 @@
 """
 STEP 7 - Streamlit web application.
 
-    pip install streamlit pandas torch numpy
-    streamlit run app.py
+Live Text-to-SQL generation with per-query assessment history.
 
-Flow
-    1. Load a trained checkpoint (sidebar).
-    2. Provide a schema, either by uploading a .csv (headers are read
-       automatically and become the column list) or by typing one in.
-    3. Ask a question in plain English.
-    4. The model generates SQL, which is shown and can be edited.
-    5. If a CSV was uploaded, the query is executed against it with
-       SQLite and the result table is displayed.
+The user enters a question and, when evaluating the model, an Expected SQL
+(Ground Truth) for that question. Each generation stores:
+  - question
+  - raw model SQL
+  - final generated SQL
+  - expected SQL
+  - exact-match accuracy
+  - component-wise accuracy
+  - execution accuracy
+  - BLEU-4
+  - execution details / result row count
 
-Everything model-side is imported from text2sql.py - the app adds no
-modelling logic of its own, only the interface and the execution layer.
+The full assessment history can be downloaded as CSV or XLSX.
 """
 
 from __future__ import annotations
@@ -25,38 +26,32 @@ import io
 import os
 import re
 import sqlite3
-import tempfile
+from collections import Counter
+from datetime import datetime
 
+import math
 import pandas as pd
 import streamlit as st
 import torch
 
-from text2sql import (Vocab, load_checkpoint, quote_table_refs,
-                      predict_sql_with_values)
+from text2sql import (
+    load_checkpoint,
+    predict_sql_with_values,
+    quote_table_refs,
+)
 
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
-
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# The WikiSQL-trained model always emits this table name (see the placeholder
-# discussion in the adapter); we register the uploaded CSV under it.
 MODEL_TABLE = "table"
 
 
+# ============================================================================
+# CHECKPOINT / MODEL
+# ============================================================================
 def resolve_ckpt(path: str) -> str | None:
-    """
-    Find a checkpoint whether the path is absolute, relative to the current
-    working directory, or relative to app.py.
-
-    `streamlit run` resolves relative paths against the directory you LAUNCHED
-    from, not the directory app.py lives in. That is why a checkpoint that
-    plainly exists shows up as "not found" - the app was started from somewhere
-    else. Checking APP_DIR too removes the trap.
-    """
     if not path:
         return None
-    for cand in (path, os.path.join(os.getcwd(), path),
-                 os.path.join(APP_DIR, path)):
+    for cand in (path, os.path.join(os.getcwd(), path), os.path.join(APP_DIR, path)):
         if os.path.isfile(cand):
             return os.path.abspath(cand)
     return None
@@ -64,7 +59,6 @@ def resolve_ckpt(path: str) -> str | None:
 
 @st.cache_data(show_spinner=False)
 def discover_ckpts() -> list[str]:
-    """Every *.pt under runs/ in either the launch dir or the app dir."""
     found = []
     for root in {os.getcwd(), APP_DIR}:
         for pat in ("runs/*/*.pt", "*.pt", "runs/*.pt"):
@@ -72,19 +66,14 @@ def discover_ckpts() -> list[str]:
     return sorted({os.path.abspath(f) for f in found})
 
 
-# ==========================================================================
-# Model loading
-# ==========================================================================
 @st.cache_resource(show_spinner="Loading model…")
 def get_model(ckpt_path: str, device: str):
     return load_checkpoint(ckpt_path, device)
 
 
-# Model inference is centralized in text2sql.py.
-
-
-# Execution layer
-# ==========================================================================
+# ============================================================================
+# CSV / SQLITE EXECUTION
+# ============================================================================
 def norm_ws(s: str) -> str:
     return " ".join((s or "").split())
 
@@ -102,7 +91,6 @@ def _sqlite_type(dtype) -> str:
 
 def create_table(con: sqlite3.Connection, df: pd.DataFrame, table_name: str,
                  nocase: bool = True) -> None:
-    """Create the in-memory SQLite table with optional case-insensitive TEXT."""
     cols = []
     for name, dtype in zip(df.columns, df.dtypes):
         t = _sqlite_type(dtype)
@@ -112,9 +100,10 @@ def create_table(con: sqlite3.Connection, df: pd.DataFrame, table_name: str,
     con.execute(f'CREATE TABLE "{table_name}" ({", ".join(cols)})')
 
 
-def run_sql(df: pd.DataFrame, sql: str, table_name: str = MODEL_TABLE,
+def run_sql(df: pd.DataFrame | None, sql: str, table_name: str = MODEL_TABLE,
             nocase: bool = True):
-    """Execute generated/edited SQL against the uploaded DataFrame."""
+    if df is None:
+        return None, "No CSV data is loaded."
     con = sqlite3.connect(":memory:")
     try:
         create_table(con, df, table_name, nocase)
@@ -132,12 +121,7 @@ def run_sql(df: pd.DataFrame, sql: str, table_name: str = MODEL_TABLE,
         con.close()
 
 
-def validate_sql(sql: str, columns) -> list:
-    """
-    Cheap static checks so obvious mistakes surface before hitting SQLite.
-    Advisory only - never blocks execution, because a wrong warning is worse
-    than no warning.
-    """
+def validate_sql(sql: str, columns) -> list[str]:
     msgs, s = [], (sql or "").strip()
     if not s:
         return ["Query is empty."]
@@ -149,30 +133,16 @@ def validate_sql(sql: str, columns) -> list:
         msgs.append("Unbalanced parentheses.")
     if not re.match(r"^\s*(SELECT|WITH)\b", s, re.I):
         msgs.append("Only SELECT queries can be run here.")
-    elif re.search(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER)\b", s, re.I):
-        msgs.append("Statement modifies data - it runs against the in-memory "
-                    "copy only, never your CSV file.")
     known = {str(c).lower() for c in (columns or [])}
     if known:
         used = {m.lower() for m in re.findall(r'"([^"]+)"', s)}
         unknown = sorted(u for u in used if u not in known and u != MODEL_TABLE)
         if unknown:
-            msgs.append("Not a column in this table: "
-                        + ", ".join('"%s"' % u for u in unknown))
+            msgs.append("Not a column in this table: " + ", ".join(f'"{u}"' for u in unknown))
     return msgs
 
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make CSV headers look like the schema the model was trained on.
-
-    WikiSQL headers are natural language with SPACES ("years in toronto",
-    "school/club team"). CSV headers are usually snake_case
-    ("Kilometers_Driven"). Fed in raw, `kilometers_driven` is a single unseen
-    token, so the model cannot link it to the words "kilometers" and "driven"
-    in the question - it emits a fragment and invents a WHERE clause.
-    Underscores therefore become spaces, matching training.
-    """
     df = df.copy()
     df.columns = [re.sub(r"\s+", " ", str(c).replace("_", " ")).strip().lower()
                   for c in df.columns]
@@ -182,23 +152,7 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
 _NUM_UNIT = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*[a-zA-Z/%]+\s*$")
 
 
-def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
-    """
-    Convert text columns like '26.6 kmpl', '998 CC', '58.16 bhp' into numbers.
-
-    Real CSVs store measurements as strings with the unit attached. SQLite
-    coerces a leading number for AVG/SUM, so those happen to work - but
-    ORDER BY, MIN/MAX and comparisons fall back to LEXICOGRAPHIC ordering and
-    return confidently WRONG answers with no error at all. Measured on
-    used_cars_data.csv:
-
-        MAX("engine")                 raw '999 CC'   vs   converted 5998
-        ORDER BY "mileage" DESC       raw '9.9 kmpl' vs   converted 33.54
-        COUNT(*) WHERE "mileage" > 25 raw 568        vs   converted 494
-
-    A silent wrong number is worse than a crash, so columns are converted when
-    at least `min_ratio` of their non-null values match number-plus-unit.
-    """
+def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple[pd.DataFrame, list[str]]:
     df, converted = df.copy(), []
     for col in df.columns:
         if df[col].dtype.kind in "ifb":
@@ -210,33 +164,197 @@ def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
         if hits.mean() >= min_ratio:
             df[col] = pd.to_numeric(
                 df[col].astype(str).str.extract(_NUM_UNIT, expand=False),
-                errors="coerce")
+                errors="coerce",
+            )
             converted.append(col)
     return df, converted
 
 
+# ============================================================================
+# LIVE ASSESSMENT METRICS
+# ============================================================================
+def _sql_norm(sql: str) -> str:
+    s = quote_table_refs(sql or "", MODEL_TABLE)
+    s = re.sub(r";+$", "", s.strip())
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _extract_clause(sql: str, keyword: str, end_keywords=()) -> str:
+    s = _sql_norm(sql)
+    m = re.search(rf"\b{re.escape(keyword.lower())}\b", s)
+    if not m:
+        return ""
+    end = len(s)
+    for k in end_keywords:
+        km = re.search(rf"\b{re.escape(k.lower())}\b", s[m.end():])
+        if km:
+            end = min(end, m.end() + km.start())
+    return s[m.start():end].strip()
+
+
+def _split_and(text: str) -> list[str]:
+    return [x.strip() for x in re.split(r"\s+and\s+", text, flags=re.I) if x.strip()]
+
+
+def _component_signature(sql: str) -> dict[str, str]:
+    s = _sql_norm(sql)
+    select = _extract_clause(s, "select", ("from",))
+    from_clause = _extract_clause(s, "from", ("where", "group by", "having", "order by", "limit"))
+    where = _extract_clause(s, "where", ("group by", "having", "order by", "limit"))
+    group_by = _extract_clause(s, "group by", ("having", "order by", "limit"))
+    order_by = _extract_clause(s, "order by", ("limit",))
+    limit = _extract_clause(s, "limit", ())
+    aggs = sorted(set(re.findall(r"\b(count|avg|sum|min|max)\s*\(", select, flags=re.I)))
+    where_conds = sorted(_split_and(where[5:].strip()) if where.startswith("where") else [])
+    return {
+        "SELECT": select,
+        "FROM": from_clause,
+        "AGGREGATION": ",".join(aggs),
+        "WHERE": " AND ".join(where_conds),
+        "GROUP BY": group_by,
+        "ORDER BY": order_by,
+        "LIMIT": limit,
+    }
+
+
+def component_accuracy(pred: str, gold: str) -> tuple[float, dict[str, float]]:
+    p = _component_signature(pred)
+    g = _component_signature(gold)
+    scores = {k: float(p[k] == g[k]) for k in p}
+    return sum(scores.values()) / max(len(scores), 1), scores
+
+
+def _bleu4(reference: str, hypothesis: str) -> float:
+    ref = re.findall(r'"[^"]*"|\'[^\']*\'|[A-Za-z_][A-Za-z_0-9]*|\S', _sql_norm(reference))
+    hyp = re.findall(r'"[^"]*"|\'[^\']*\'|[A-Za-z_][A-Za-z_0-9]*|\S', _sql_norm(hypothesis))
+    if not hyp:
+        return 0.0
+    precisions = []
+    for n in range(1, 5):
+        hyp_ngrams = Counter(tuple(hyp[i:i+n]) for i in range(len(hyp)-n+1))
+        ref_ngrams = Counter(tuple(ref[i:i+n]) for i in range(len(ref)-n+1))
+        if not hyp_ngrams:
+            precisions.append(1.0 if len(hyp) < n else 0.0)
+            continue
+        clipped = sum(min(c, ref_ngrams[ng]) for ng, c in hyp_ngrams.items())
+        precisions.append((clipped + 1.0) / (sum(hyp_ngrams.values()) + 1.0))
+    geo = math.exp(sum(math.log(max(p, 1e-12)) for p in precisions) / 4.0)
+    bp = 1.0 if len(hyp) > len(ref) else math.exp(1.0 - len(ref) / len(hyp))
+    return float(geo * bp)
+
+
+def _execution_match(df: pd.DataFrame | None, pred: str, gold: str,
+                     nocase: bool) -> tuple[bool | None, str, int | None]:
+    if df is None:
+        return None, "CSV required for execution accuracy.", None
+    pred_df, pred_err = run_sql(df, pred, MODEL_TABLE, nocase)
+    gold_df, gold_err = run_sql(df, gold, MODEL_TABLE, nocase)
+    if pred_err:
+        return False, f"Generated SQL error: {pred_err}", None
+    if gold_err:
+        return False, f"Expected SQL error: {gold_err}", None
+    try:
+        same = pred_df.reset_index(drop=True).equals(gold_df.reset_index(drop=True))
+        return bool(same), "", int(len(pred_df))
+    except Exception as e:
+        return False, str(e), None
+
+
+def assess_live_query(question: str, predicted_sql: str, expected_sql: str,
+                      df: pd.DataFrame | None, nocase: bool) -> dict:
+    expected_sql = (expected_sql or "").strip()
+    pred_sql = (predicted_sql or "").strip()
+    exact = bool(expected_sql) and (_sql_norm(pred_sql) == _sql_norm(expected_sql))
+    comp_mean, comp = component_accuracy(pred_sql, expected_sql) if expected_sql else (None, {})
+    exec_ok, exec_note, generated_rows = _execution_match(
+        df, pred_sql, expected_sql, nocase) if expected_sql else (None, "Expected SQL not supplied.", None)
+    bleu = _bleu4(expected_sql, pred_sql) if expected_sql else None
+    return {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Question": question,
+        "Raw Model SQL": st.session_state.get("raw_sql", ""),
+        "Generated SQL": pred_sql,
+        "Expected SQL": expected_sql,
+        "Exact-Match Accuracy": exact if expected_sql else None,
+        "Component-wise Accuracy": comp_mean,
+        "Execution Accuracy": exec_ok,
+        "BLEU-4": bleu,
+        "SELECT Acc.": comp.get("SELECT"),
+        "FROM Acc.": comp.get("FROM"),
+        "Aggregation Acc.": comp.get("AGGREGATION"),
+        "WHERE Acc.": comp.get("WHERE"),
+        "GROUP BY Acc.": comp.get("GROUP BY"),
+        "ORDER BY Acc.": comp.get("ORDER BY"),
+        "LIMIT Acc.": comp.get("LIMIT"),
+        "Generated Rows": generated_rows,
+        "Execution Note": exec_note,
+        "Executed SQL": "",
+        "Executed Rows": None,
+    }
+
+
+def history_csv_bytes(history: list[dict]) -> bytes:
+    return pd.DataFrame(history).to_csv(index=False).encode("utf-8")
+
+
+def history_xlsx_bytes(history: list[dict]) -> bytes | None:
+    out = io.BytesIO()
+    try:
+        engine = None
+        for candidate in ("openpyxl", "xlsxwriter"):
+            try:
+                __import__(candidate)
+                engine = candidate
+                break
+            except ImportError:
+                continue
+        if engine is None:
+            return None
+        with pd.ExcelWriter(out, engine=engine) as writer:
+            df_hist = pd.DataFrame(history)
+            df_hist.to_excel(writer, sheet_name="Assessment History", index=False)
+            if not df_hist.empty:
+                summary = pd.DataFrame({
+                    "Metric": [
+                        "Exact-Match Accuracy",
+                        "Component-wise Accuracy",
+                        "Execution Accuracy",
+                        "BLEU-4",
+                        "Queries Assessed",
+                    ],
+                    "Value": [
+                        pd.to_numeric(df_hist["Exact-Match Accuracy"], errors="coerce").mean(),
+                        pd.to_numeric(df_hist["Component-wise Accuracy"], errors="coerce").mean(),
+                        pd.to_numeric(df_hist["Execution Accuracy"], errors="coerce").mean(),
+                        pd.to_numeric(df_hist["BLEU-4"], errors="coerce").mean(),
+                        len(df_hist),
+                    ],
+                })
+                summary.to_excel(writer, sheet_name="Summary", index=False)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+# ============================================================================
 # UI
-# ==========================================================================
+# ============================================================================
 st.title("🗄️ Text-to-SQL")
 st.caption("Pipeline: decoder-level SQL constraints v5")
-st.caption("Ask a question in plain English. The model reads your table's schema and writes the SQL.")
-st.caption("Pipeline version: mandatory semantic inference v4")
+st.caption("Each generated query can be assessed live against a supplied ground-truth SQL.")
 
 with st.sidebar:
     st.header("Model")
     found = discover_ckpts()
     if found:
-        labels = [os.path.relpath(f, os.getcwd()) if f.startswith(os.getcwd())
-                  else f for f in found]
+        labels = [os.path.relpath(f, os.getcwd()) if f.startswith(os.getcwd()) else f
+                  for f in found]
         pick = st.selectbox("Detected checkpoints", labels + ["Other path…"])
-        ckpt_raw = (st.text_input("Checkpoint path",
-                                  value="runs/seq2seq_copy/best.pt")
+        ckpt_raw = (st.text_input("Checkpoint path", value="runs/seq2seq_copy/best.pt")
                     if pick == "Other path…" else found[labels.index(pick)])
     else:
-        ckpt_raw = st.text_input("Checkpoint path",
-                                 value="runs/seq2seq_copy/best.pt")
-    device = st.selectbox("Device", ["cpu", "cuda"] if torch.cuda.is_available()
-                          else ["cpu"])
+        ckpt_raw = st.text_input("Checkpoint path", value="runs/seq2seq_copy/best.pt")
+    device = st.selectbox("Device", ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"])
     st.divider()
     st.header("Decoding")
     strategy = st.radio("Strategy", ["Greedy", "Beam search"], horizontal=True)
@@ -245,19 +363,11 @@ with st.sidebar:
     st.divider()
     auto_exec = st.checkbox("Execute query automatically", value=True)
     nocase = st.checkbox("Case-insensitive text matching", value=True,
-                         help="Declares text columns COLLATE NOCASE so "
-                              "WHERE \"city\" = 'mumbai' matches 'Mumbai'. "
-                              "The model lowercases everything, so without "
-                              "this most WHERE clauses return zero rows.")
+                         help="Declares text columns COLLATE NOCASE so case differences in text filters do not change results.")
     constrain = st.checkbox("Restrict columns to the schema", value=True,
-                            help="Forces every generated column name to be a "
-                                 "real column. Without it the model emits "
-                                 "fragments like \"type\" instead of "
-                                 "\"fuel type\".")
-    clean_units = st.checkbox("Strip units from numeric-looking text columns",
-                              value=True,
-                              help="Turns '26.6 kmpl' into 26.6 so AVG/MIN/MAX "
-                                   "work on those columns.")
+                            help="Forces generated column identifiers to be real columns.")
+    clean_units = st.checkbox("Strip units from numeric-looking text columns", value=True,
+                              help="Turns values such as '26.6 kmpl' into numeric values for aggregation and ordering.")
 
 ckpt = resolve_ckpt(ckpt_raw)
 model = None
@@ -266,29 +376,20 @@ if ckpt:
         model, src_vocab, tgt_vocab, cfg = get_model(ckpt, device)
         with st.sidebar:
             st.success("Model loaded")
-            st.caption(f"{cfg['emb_dim']}d emb · {cfg['hid_dim']}d hidden · "
-                       f"copy {'on' if cfg['use_copy'] else 'off'} · "
-                       f"trained on {cfg['dataset']}")
+            st.caption(f"{cfg['emb_dim']}d emb · {cfg['hid_dim']}d hidden · copy {'on' if cfg['use_copy'] else 'off'} · trained on {cfg['dataset']}")
     except Exception as e:
         st.sidebar.error(f"Could not load checkpoint: {e}")
 else:
     with st.sidebar:
         st.warning("No checkpoint found at that path.")
-        st.caption("Relative paths are resolved from the directory you ran "
-                   "`streamlit run` in — not from app.py.")
-        st.code(f"looked for : {ckpt_raw}\n"
-                f"working dir: {os.getcwd()}\n"
-                f"app dir    : {APP_DIR}", language="text")
-        st.caption("Fix: paste the **absolute** path above, or `cd` into the "
-                   "project folder before launching. Train one with "
-                   "`python text2sql.py train --wikisql WikiSQL/data`.")
+        st.caption("Use an absolute checkpoint path or launch Streamlit from the project directory.")
 
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 1. Schema
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 st.subheader("1 · Your table")
-mode = st.radio("Schema source", ["Upload a CSV", "Enter columns manually"],
-                horizontal=True, label_visibility="collapsed")
+mode = st.radio("Schema source", ["Upload a CSV", "Enter columns manually"], horizontal=True,
+                label_visibility="collapsed")
 
 df, columns, table_name = None, [], MODEL_TABLE
 
@@ -302,129 +403,120 @@ if mode == "Upload a CSV":
                 df, converted = strip_units(df)
             columns = list(df.columns)
             table_name = re.sub(r"\W+", "_", os.path.splitext(up.name)[0]).lower()
-            st.success(f"Read **{len(df):,} rows × {len(columns)} columns** "
-                       f"from `{up.name}`")
+            st.success(f"Read **{len(df):,} rows × {len(columns)} columns** from `{up.name}`")
             if converted:
-                st.info("Converted to numeric by stripping units: "
-                        + ", ".join(f"`{c}`" for c in converted)
-                        + " — without this, ORDER BY and MIN/MAX on these "
-                          "columns sort as text and give wrong answers.")
+                st.info("Converted numeric-looking columns: " + ", ".join(f"`{c}`" for c in converted))
             c1, c2 = st.columns([2, 1])
             with c1:
-                st.dataframe(df.head(8), width='stretch')
+                st.dataframe(df.head(8), width="stretch")
             with c2:
                 st.write("**Detected schema**")
-                st.dataframe(pd.DataFrame({
-                    "column": columns,
-                    "type": [str(t) for t in df.dtypes]}),
-                    width='stretch', hide_index=True)
+                st.dataframe(pd.DataFrame({"column": columns, "type": [str(t) for t in df.dtypes]}),
+                             width="stretch", hide_index=True)
         except Exception as e:
             st.error(f"Could not read the CSV: {e}")
 else:
     table_name = st.text_input("Table name", value="employees")
-    raw = st.text_input("Columns (comma-separated)",
-                        value="employee_id, name, department, salary, hire_date")
-    columns = [re.sub(r"\s+", " ", c.replace("_", " ")).strip().lower()
-               for c in raw.split(",") if c.strip()]
+    raw = st.text_input("Columns (comma-separated)", value="employee_id, name, department, salary, hire_date")
+    columns = [re.sub(r"\s+", " ", c.replace("_", " ")).strip().lower() for c in raw.split(",") if c.strip()]
     if columns:
         st.caption(f"{len(columns)} columns: " + ", ".join(f"`{c}`" for c in columns))
 
-# --------------------------------------------------------------------------
-# 2. Question
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 2. Question + optional ground truth
+# -----------------------------------------------------------------------------
 st.subheader("2 · Your question")
-examples = [
-    "What is the average salary in the sales department?",
-    "How many employees are there in each department?",
-    "Show the name of the employee with the highest salary",
-    "Count the records where the status is shipped",
-]
-st.caption("Example questions: " + " | ".join(examples))
-question = st.text_input(
-    "Question",
-    placeholder="e.g. what is the average salary in the sales department?",
-    label_visibility="collapsed")
+st.caption("Example: How many cars have fuel type Petrol and transmission Manual?")
+question = st.text_input("Question", placeholder="Enter a natural-language question…", label_visibility="collapsed")
+expected_sql = st.text_area(
+    "Expected SQL (Ground Truth — for assessment)",
+    placeholder="Paste the expected SQL here to calculate Exact-Match, Component-wise, Execution Accuracy and BLEU-4. Leave blank if you only want generation.",
+    height=90,
+)
 
-go = st.button("Generate SQL", type="primary", disabled=not (model and columns
-                                                             and question.strip()))
+go = st.button("Generate SQL", type="primary", disabled=not (model and columns and question.strip()))
 
 if not columns:
     st.info("Upload a CSV or enter columns to continue.")
 
-# --------------------------------------------------------------------------
-# 3. Generate
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 3. Generate + assess live
+# -----------------------------------------------------------------------------
 if go:
     with st.spinner("Generating…"):
         result = predict_sql_with_values(
             model, question, MODEL_TABLE, columns, src_vocab, tgt_vocab,
             beam=beam, max_len=max_len, device=device, df_or_rows=df,
-            constrain_columns=constrain)
+            constrain_columns=constrain,
+        )
 
     raw_sql = result["raw_sql"]
     sql = result["sql"]
-    src_tokens = result["src_tokens"]
-    out_tokens = result["out_tokens"]
-    attn = result["attn"]
 
     st.session_state["raw_sql"] = raw_sql
-    st.session_state["post"] = ["decoder-level question/SQL constraints enforced"]
     st.session_state["sql"] = sql
     st.session_state["editor"] = sql
-    st.session_state["src_tokens"] = src_tokens
-    st.session_state["out_tokens"] = out_tokens
-    st.session_state["attn"] = attn
+    st.session_state["src_tokens"] = result["src_tokens"]
+    st.session_state["out_tokens"] = result["out_tokens"]
+    st.session_state["attn"] = result["attn"]
+    st.session_state["current_question"] = question
+    st.session_state["current_assessment"] = assess_live_query(
+        question, sql, expected_sql, df, nocase
+    )
 
+    history = st.session_state.setdefault("assessment_history", [])
+    history.append(st.session_state["current_assessment"].copy())
+
+# -----------------------------------------------------------------------------
+# 3. Generated SQL
+# -----------------------------------------------------------------------------
 if "sql" in st.session_state:
     st.subheader("3 · Generated SQL")
     st.code(st.session_state["sql"], language="sql")
-    for note in st.session_state.get("post", []):
-        st.caption("🔧 post-processing: " + note)
+    st.caption("Raw model output")
+    st.code(st.session_state.get("raw_sql", ""), language="sql")
+
+    current = st.session_state.get("current_assessment")
+    if current and current.get("Expected SQL"):
+        st.subheader("Live Assessment")
+        values = [current.get("Exact-Match Accuracy"), current.get("Component-wise Accuracy"),
+                  current.get("Execution Accuracy"), current.get("BLEU-4")]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Exact Match", "N/A" if values[0] is None else ("100%" if values[0] else "0%"))
+        c2.metric("Component-wise", "N/A" if values[1] is None else f"{values[1]:.1%}")
+        c3.metric("Execution", "N/A" if values[2] is None else ("100%" if values[2] else "0%"))
+        c4.metric("BLEU-4", "N/A" if values[3] is None else f"{values[3]:.3f}")
+        st.caption("Assessment is calculated against the Expected SQL entered above. Execution accuracy compares the generated and expected result sets on the uploaded CSV.")
+    elif current:
+        st.info("No Expected SQL was supplied, so assessment metrics are not calculated for this query.")
 
     with st.expander("How the model read your input"):
         st.write("**Encoder input** (question + serialised schema)")
         st.code(" ".join(st.session_state["src_tokens"]), language="text")
         attn = st.session_state.get("attn")
         if attn:
-            st.write("**Attention** — which input token each output token "
-                     "attended to. Column names lighting up next to question "
-                     "words is schema linking working.")
+            st.write("**Attention** — which input token each output token attended to.")
             import numpy as np
             src_toks = st.session_state["src_tokens"]
             out_toks = st.session_state["out_tokens"][: len(attn)]
-            # Labels MUST be unique: the input repeats `<col>` once per column
-            # and the output can repeat a token, and pandas' Styler refuses to
-            # apply a gradient to a frame with duplicate index or columns.
-            m = pd.DataFrame(
-                np.array(attn),
-                index=[f"{i}. {t}" for i, t in enumerate(out_toks)],
-                columns=[f"{i}. {t}" for i, t in enumerate(src_toks)])
-            st.dataframe(m.style.background_gradient(axis=1, cmap="Blues")
-                         .format("{:.2f}"), width='stretch')
-        else:
-            st.caption("Attention weights are only collected for greedy decoding.")
+            m = pd.DataFrame(np.array(attn),
+                             index=[f"{i}. {t}" for i, t in enumerate(out_toks)],
+                             columns=[f"{i}. {t}" for i, t in enumerate(src_toks)])
+            st.dataframe(m.style.background_gradient(axis=1).format("{:.2f}"), width="stretch")
 
     # ----------------------------------------------------------------------
     # 4. Execute
     # ----------------------------------------------------------------------
     st.subheader("4 · Edit and run")
-
-    # The editor MUST have a key. Without one, Streamlit re-seeds the widget
-    # from `value` on every rerun, so clicking Execute silently discarded the
-    # user's edits and re-ran the model's original SQL.
     if "editor" not in st.session_state:
         st.session_state["editor"] = st.session_state["sql"]
 
     edited = st.text_area(
         "SQL — edit freely, then run",
         key="editor", height=110,
-        help="Fix a wrong column, add a GROUP BY, change the WHERE value — "
-             "anything. The query below is what actually runs.")
+        help="The query below is what actually runs. Assessment metrics remain based on the generated SQL, not later edits.")
 
     def _reset_editor():
-        # MUST be an on_click callback: Streamlit refuses to mutate a widget's
-        # session_state key after the widget has been instantiated this run.
-        # Callbacks execute before the script reruns, so this is legal.
         st.session_state["editor"] = st.session_state["sql"]
 
     c1, c2, c3 = st.columns([1, 1, 3])
@@ -432,44 +524,74 @@ if "sql" in st.session_state:
     c2.button("↺ Reset to generated", on_click=_reset_editor)
 
     dirty = norm_ws(edited) != norm_ws(st.session_state["sql"])
-    if dirty:
-        c3.caption("✏️ edited — differs from the generated query")
-    else:
-        c3.caption("unmodified model output")
+    c3.caption("✏️ edited — differs from generated query" if dirty else "unmodified model output")
 
-    # cheap static checks before touching the database
     problems = validate_sql(edited, columns)
     for p in problems:
         st.warning(p)
 
     if df is None:
         st.info("Upload a CSV to execute the query against real data.")
-    else:
-        if run_clicked or (auto_exec and not dirty):
-            result, err = run_sql(df, edited, MODEL_TABLE, nocase)
-            if err:
-                st.error(f"SQLite error: {err}")
-                st.caption("Edit the query above and press Run query.")
-            else:
-                st.success(f"{len(result):,} row(s) returned"
-                           + (" · from your edited query" if dirty else ""))
-                st.dataframe(result, width='stretch')
-                st.download_button("Download result as CSV",
-                                   result.to_csv(index=False).encode(),
-                                   file_name="result.csv", mime="text/csv")
-                hist = st.session_state.setdefault("history", [])
-                if not hist or hist[-1][0] != edited:
-                    hist.append((edited, len(result)))
-        elif dirty:
-            st.info("Query edited — press **Run query** to execute it.")
+    elif run_clicked or (auto_exec and not dirty):
+        result_df, err = run_sql(df, edited, MODEL_TABLE, nocase)
+        if err:
+            st.error(f"SQLite error: {err}")
+            st.caption("Edit the query above and press Run query.")
+        else:
+            st.success(f"{len(result_df):,} row(s) returned" + (" · from your edited query" if dirty else ""))
+            st.dataframe(result_df, width="stretch")
+            st.download_button("Download result as CSV",
+                               result_df.to_csv(index=False).encode(),
+                               file_name="result.csv", mime="text/csv")
+            # Record the actual executed SQL/result rows against the latest assessment entry.
+            history = st.session_state.setdefault("assessment_history", [])
+            if history:
+                history[-1]["Executed SQL"] = edited
+                history[-1]["Executed Rows"] = int(len(result_df))
+        
+# -----------------------------------------------------------------------------
+# 5. Assessment history + downloads
+# -----------------------------------------------------------------------------
+history = st.session_state.get("assessment_history", [])
+if history:
+    st.subheader("5 · Assessment History")
+    hist_df = pd.DataFrame(history)
 
-    if st.session_state.get("history"):
-        with st.expander(f"Query history ({len(st.session_state['history'])})"):
-            for i, (q, n) in enumerate(reversed(st.session_state["history"][-10:]), 1):
-                st.code(q, language="sql")
-                st.caption(f"{n:,} row(s)")
+    assessed = hist_df[hist_df["Expected SQL"].astype(str).str.strip() != ""]
+    if not assessed.empty:
+        c1, c2, c3, c4 = st.columns(4)
+        exact_avg = pd.to_numeric(assessed["Exact-Match Accuracy"], errors="coerce").mean()
+        comp_avg = pd.to_numeric(assessed["Component-wise Accuracy"], errors="coerce").mean()
+        exec_avg = pd.to_numeric(assessed["Execution Accuracy"], errors="coerce").mean()
+        bleu_avg = pd.to_numeric(assessed["BLEU-4"], errors="coerce").mean()
+        c1.metric("Exact Match", "N/A" if pd.isna(exact_avg) else f"{exact_avg:.1%}")
+        c2.metric("Component-wise", "N/A" if pd.isna(comp_avg) else f"{comp_avg:.1%}")
+        c3.metric("Execution", "N/A" if pd.isna(exec_avg) else f"{exec_avg:.1%}")
+        c4.metric("BLEU-4", "N/A" if pd.isna(bleu_avg) else f"{bleu_avg:.3f}")
+
+    st.dataframe(hist_df, width="stretch", hide_index=True)
+
+    b1, b2, b3 = st.columns([1, 1, 2])
+    b1.download_button(
+        "Download history CSV",
+        history_csv_bytes(history),
+        file_name="text2sql_assessment_history.csv",
+        mime="text/csv",
+    )
+    xlsx = history_xlsx_bytes(history)
+    if xlsx is not None:
+        b2.download_button(
+            "Download history XLSX",
+            xlsx,
+            file_name="text2sql_assessment_history.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        b2.warning("XLSX export requires openpyxl in the Streamlit environment.")
+
+    if b3.button("Clear assessment history"):
+        st.session_state["assessment_history"] = []
+        st.rerun()
 
 st.divider()
-st.caption("Encoder–Decoder (BiLSTM + Bahdanau attention + pointer-generator "
-           "copy), trained on WikiSQL. Generated SQL is not guaranteed correct — "
-           "always read it before trusting the result.")
+st.caption("Encoder–Decoder (BiLSTM + Bahdanau attention + pointer-generator copy), trained on WikiSQL. Generated SQL is not guaranteed correct — always review it before trusting the result.")
