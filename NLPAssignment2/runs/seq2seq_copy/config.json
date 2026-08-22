@@ -1,7 +1,7 @@
 {
   "dataset": "wikisql",
-  "src_max_len": 60,
-  "tgt_max_len": 45,
+  "src_max_len": 96,
+  "tgt_max_len": 60,
   "src_min_freq": 2,
   "tgt_min_freq": 2,
   "max_src_vocab": 30000,
@@ -25,7 +25,7 @@
   "device": "cuda",
   "run_name": "seq2seq_copy",
   "notes": "",
-  "param_count": 40021913,
-  "src_vocab_size": 18961,
+  "param_count": 40088473,
+  "src_vocab_size": 19221,
   "tgt_vocab_size": 15000
 }
