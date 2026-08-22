@@ -35,6 +35,11 @@ from text2sql import (SOS_ID, UNK_ID, EOS_ID, Vocab, beam_decode,
                       build_extended, build_source_sequence, detokenize_sql,
                       greedy_decode, load_checkpoint, outputids_to_tokens,
                       quote_table_refs, build_column_trie, repair_sql)
+from text2sql import (
+    predict_sql_with_values,
+    semantic_repair_sql,
+    build_value_candidates,
+)
 
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
 
