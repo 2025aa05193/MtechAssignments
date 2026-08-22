@@ -1854,9 +1854,25 @@ def greedy_decode(model, src_ids, src_ext_ids, n_oov, max_len=45, device="cpu"):
 
 
 # --------------------------------------------------------------------------
+def _trie_state(tokens, trie, quote_id):
+    """Replay a hypothesis to find the current position inside a column name.
+    Returns the trie node if we are inside a quoted span, else None."""
+    node = None
+    for t in tokens:
+        if node is None:
+            node = trie if t == quote_id else None
+        elif t == quote_id:
+            node = None
+        else:
+            node = node.get(t)
+            if node is None:
+                return None
+    return node
+
+
 @torch.no_grad()
 def beam_decode(model, src_ids, src_ext_ids, n_oov, beam_size=5, max_len=45,
-                length_penalty=0.7, device="cpu"):
+                length_penalty=0.7, device="cpu", trie=None, quote_id=None):
     """
     Beam search with a GNMT-style length penalty:
         score = logP / ((5 + |Y|)/6) ** alpha
@@ -1883,7 +1899,22 @@ def beam_decode(model, src_ids, src_ext_ids, n_oov, beam_size=5, max_len=45,
             p, st2, ct2, _, _ = model.decoder.step(
                 y, st, ct, enc_out, mask, src_ext, n_oov)
             logp = torch.log(p.squeeze(0) + 1e-10)
-            top_lp, top_ix = logp.topk(beam_size)
+            if trie is not None and quote_id is not None:
+                # same schema constraint as constrained_greedy_decode, applied
+                # per hypothesis: mask everything that cannot continue a real
+                # column name while inside a double-quoted span
+                node = _trie_state(tokens, trie, quote_id)
+                if node is not None:
+                    allowed = [k for k in node if k != "_END"]
+                    if node.get("_END"):
+                        allowed.append(quote_id)
+                    allowed = [a for a in allowed if a < logp.numel()]
+                    if allowed:
+                        m = torch.full_like(logp, float("-inf"))
+                        idx = torch.tensor(allowed, device=logp.device)
+                        m[idx] = logp[idx]
+                        logp = m
+            top_lp, top_ix = logp.topk(min(beam_size, int((logp > -1e30).sum())))
             for lp, ix in zip(top_lp.tolist(), top_ix.tolist()):
                 candidates.append((tokens + [ix], score + lp, st2, ct2))
 
@@ -1908,16 +1939,119 @@ def beam_decode(model, src_ids, src_ext_ids, n_oov, beam_size=5, max_len=45,
 
 
 # --------------------------------------------------------------------------
+def _tok_to_id(tok: str, tgt_vocab: Vocab, oovs: Sequence[str]):
+    """Target-vocab id, or the example's extended-vocab slot, or None."""
+    i = tgt_vocab.stoi.get(tok)
+    if i is not None:
+        return i
+    if tok in oovs:
+        return len(tgt_vocab) + list(oovs).index(tok)
+    return None
+
+
+def build_column_trie(columns: Sequence[str], tgt_vocab: Vocab,
+                      oovs: Sequence[str]) -> dict:
+    """
+    Prefix tree over the TOKEN SEQUENCES of the real schema columns.
+
+    `_END` marks a node where a complete column name finishes, so the decoder
+    knows a closing quote is allowed there. A column whose tokens are not all
+    representable (neither in the target vocab nor copyable) is skipped - it
+    could never be produced anyway.
+    """
+    root: dict = {}
+    for col in columns:
+        ids = [_tok_to_id(t, tgt_vocab, oovs) for t in tokenize_value(str(col))]
+        if not ids or any(i is None for i in ids):
+            continue
+        node = root
+        for i in ids:
+            node = node.setdefault(i, {})
+        node["_END"] = True
+    return root
+
+
+@torch.no_grad()
+def constrained_greedy_decode(model, src_ids, src_ext_ids, n_oov, columns,
+                              tgt_vocab, oovs, max_len=45, device="cpu"):
+    """
+    Greedy decoding that forces every double-quoted identifier to be a REAL
+    column of the schema.
+
+    Why this is needed: the decoder emits column names one token at a time and
+    nothing stops it halting mid-name. With columns like `fuel type` and
+    `kilometers driven`, an unconstrained model produces `"type"` or
+    `"kilometers"` - fragments that match no column, so the query cannot run.
+
+    Inside a quoted span the candidate set is restricted to tokens that
+    continue some column prefix, and the closing quote is permitted only where
+    a complete column name ends. This is a pure inference-time fix: no
+    retraining, and it can only replace an invalid column with a valid one.
+    """
+    V = model.tgt_vocab_size
+    quote_id = tgt_vocab.stoi.get('"')
+    trie = build_column_trie(columns, tgt_vocab, oovs)
+    if quote_id is None or not trie:            # nothing to constrain against
+        return greedy_decode(model, src_ids, src_ext_ids, n_oov, max_len, device)
+
+    src = torch.tensor([src_ids], device=device)
+    src_ext = torch.tensor([src_ext_ids], device=device)
+    enc_out, state, mask = model.encode(src, torch.tensor([len(src_ids)]))
+    ctx = torch.zeros(1, model.enc_dim, device=device)
+    y = torch.tensor([SOS_ID], device=device)
+
+    out, node = [], None                        # node is None when outside a span
+    for _ in range(max_len):
+        p, state, ctx, _, _ = model.decoder.step(
+            y, state, ctx, enc_out, mask, src_ext, n_oov)
+        probs = p.squeeze(0)
+
+        if node is None:
+            nxt = int(probs.argmax())
+            if nxt == quote_id:
+                node = trie                     # opening quote -> start of a column
+        else:
+            allowed = [k for k in node if k != "_END"]
+            if node.get("_END"):
+                allowed.append(quote_id)        # a complete name may close here
+            allowed = [a for a in allowed if a < probs.numel()]
+            if not allowed:
+                node = None
+                nxt = int(probs.argmax())
+            else:
+                idx = torch.tensor(allowed, device=probs.device)
+                nxt = int(idx[probs[idx].argmax()])
+                node = None if nxt == quote_id else node[nxt]
+
+        if nxt == EOS_ID:
+            break
+        out.append(nxt)
+        y = _clamp(torch.tensor([nxt], device=device), V)
+    return out
+
+
+# --------------------------------------------------------------------------
 def predict_sql(model, question: str, table: str, columns: Sequence[str],
                 src_vocab: Vocab, tgt_vocab: Vocab, beam: int = 1,
-                max_len: int = 45, device: str = "cpu") -> str:
+                max_len: int = 45, device: str = "cpu",
+                constrain_columns: bool = True) -> str:
     """End-to-end: raw question + schema -> SQL string."""
     src_tokens = build_source_sequence(question, table, list(columns))
     src_ids, src_ext, _, _, oovs = build_extended(
         src_tokens, [], src_vocab, tgt_vocab)
-    fn = greedy_decode if beam <= 1 else (
-        lambda *a, **k: beam_decode(*a, beam_size=beam, **k))
-    ids = fn(model, src_ids, src_ext, len(oovs), max_len=max_len, device=device)
+
+    trie = build_column_trie(columns, tgt_vocab, oovs) if constrain_columns else None
+    quote_id = tgt_vocab.stoi.get('"')
+
+    if beam > 1:
+        ids = beam_decode(model, src_ids, src_ext, len(oovs), beam_size=beam,
+                          max_len=max_len, device=device,
+                          trie=trie or None, quote_id=quote_id)
+    elif constrain_columns:
+        ids = constrained_greedy_decode(model, src_ids, src_ext, len(oovs),
+                                        columns, tgt_vocab, oovs, max_len, device)
+    else:
+        ids = greedy_decode(model, src_ids, src_ext, len(oovs), max_len, device)
     return detokenize_sql(outputids_to_tokens(ids, tgt_vocab, oovs))
 
 

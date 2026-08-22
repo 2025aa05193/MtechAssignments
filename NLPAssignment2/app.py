@@ -33,7 +33,7 @@ import torch
 from text2sql import (SOS_ID, UNK_ID, EOS_ID, Vocab, beam_decode,
                       build_extended, build_source_sequence, detokenize_sql,
                       greedy_decode, load_checkpoint, outputids_to_tokens,
-                      quote_table_refs)
+                      quote_table_refs, build_column_trie)
 
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
 
@@ -83,24 +83,28 @@ def get_model(ckpt_path: str, device: str):
 
 @torch.no_grad()
 def generate(model, src_vocab, tgt_vocab, question, table, columns,
-             beam, max_len, device):
-    """Returns (sql_string, source_tokens, attention_matrix)."""
+             beam, max_len, device, constrain=True):
+    """Returns (sql_string, source_tokens, output_tokens, attention_matrix)."""
     src_tokens = build_source_sequence(question, table, list(columns))
     src_ids, src_ext, _, _, oovs = build_extended(src_tokens, [], src_vocab, tgt_vocab)
+    trie = build_column_trie(columns, tgt_vocab, oovs) if constrain else None
+    quote_id = tgt_vocab.stoi.get('"')
 
     if beam > 1:
         ids = beam_decode(model, src_ids, src_ext, len(oovs), beam_size=beam,
-                          max_len=max_len, device=device)
+                          max_len=max_len, device=device,
+                          trie=trie or None, quote_id=quote_id)
         attn = None
     else:
         ids, attn = _greedy_with_attention(model, src_ids, src_ext, len(oovs),
-                                           max_len, device)
+                                           max_len, device, trie, quote_id)
     tokens = outputids_to_tokens(ids, tgt_vocab, oovs)
     return detokenize_sql(tokens), src_tokens, tokens, attn
 
 
 @torch.no_grad()
-def _greedy_with_attention(model, src_ids, src_ext_ids, n_oov, max_len, device):
+def _greedy_with_attention(model, src_ids, src_ext_ids, n_oov, max_len, device,
+                           trie=None, quote_id=None):
     """Greedy decoding that also collects the attention weights, so the app can
     show WHICH input tokens the model looked at - the schema-linking evidence."""
     V = model.tgt_vocab_size
@@ -110,11 +114,28 @@ def _greedy_with_attention(model, src_ids, src_ext_ids, n_oov, max_len, device):
     ctx = torch.zeros(1, model.enc_dim, device=device)
     y = torch.tensor([SOS_ID], device=device)
 
-    out, attns = [], []
+    out, attns, node = [], [], None
     for _ in range(max_len):
         p, state, ctx, a, _ = model.decoder.step(
             y, state, ctx, enc_out, mask, src_ext, n_oov)
-        nxt = int(p.argmax(-1))
+        probs = p.squeeze(0)
+        # schema constraint: inside a quoted span only allow tokens that
+        # continue a real column name (see constrained_greedy_decode)
+        if trie and quote_id is not None and node is not None:
+            allowed = [k for k in node if k != "_END"]
+            if node.get("_END"):
+                allowed.append(quote_id)
+            allowed = [x for x in allowed if x < probs.numel()]
+            if allowed:
+                idx = torch.tensor(allowed, device=probs.device)
+                nxt = int(idx[probs[idx].argmax()])
+                node = None if nxt == quote_id else node[nxt]
+            else:
+                node, nxt = None, int(probs.argmax())
+        else:
+            nxt = int(probs.argmax())
+            if trie and quote_id is not None and nxt == quote_id:
+                node = trie
         if nxt == EOS_ID:
             break
         out.append(nxt)
@@ -228,6 +249,11 @@ with st.sidebar:
     max_len = st.slider("Max SQL length (tokens)", 10, 80, 45)
     st.divider()
     auto_exec = st.checkbox("Execute query automatically", value=True)
+    constrain = st.checkbox("Restrict columns to the schema", value=True,
+                            help="Forces every generated column name to be a "
+                                 "real column. Without it the model emits "
+                                 "fragments like \"type\" instead of "
+                                 "\"fuel type\".")
     clean_units = st.checkbox("Strip units from numeric-looking text columns",
                               value=True,
                               help="Turns '26.6 kmpl' into 26.6 so AVG/MIN/MAX "
@@ -333,7 +359,7 @@ if go:
     with st.spinner("Generating…"):
         sql, src_tokens, out_tokens, attn = generate(
             model, src_vocab, tgt_vocab, question, MODEL_TABLE, columns,
-            beam, max_len, device)
+            beam, max_len, device, constrain)
     st.session_state["sql"] = sql
     st.session_state["src_tokens"] = src_tokens
     st.session_state["out_tokens"] = out_tokens
