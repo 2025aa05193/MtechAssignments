@@ -89,6 +89,49 @@ def norm_ws(s: str) -> str:
     return " ".join((s or "").split())
 
 
+def _sqlite_type(dtype) -> str:
+    k = getattr(dtype, "kind", "O")
+    if k in "iu":
+        return "INTEGER"
+    if k == "f":
+        return "REAL"
+    if k == "b":
+        return "INTEGER"
+    return "TEXT"
+
+
+def create_table(con: sqlite3.Connection, df: pd.DataFrame, table_name: str,
+                 nocase: bool = True) -> None:
+    """Create the in-memory SQLite table with optional case-insensitive TEXT."""
+    cols = []
+    for name, dtype in zip(df.columns, df.dtypes):
+        t = _sqlite_type(dtype)
+        collate = " COLLATE NOCASE" if (nocase and t == "TEXT") else ""
+        cols.append(f'"{name}" {t}{collate}')
+    con.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+    con.execute(f'CREATE TABLE "{table_name}" ({", ".join(cols)})')
+
+
+def run_sql(df: pd.DataFrame, sql: str, table_name: str = MODEL_TABLE,
+            nocase: bool = True):
+    """Execute generated/edited SQL against the uploaded DataFrame."""
+    con = sqlite3.connect(":memory:")
+    try:
+        create_table(con, df, table_name, nocase)
+        df.to_sql(table_name, con, index=False, if_exists="append")
+        for alias in ("data", "df", "t"):
+            if alias != table_name:
+                try:
+                    con.execute(f'CREATE VIEW "{alias}" AS SELECT * FROM "{table_name}"')
+                except sqlite3.Error:
+                    pass
+        return pd.read_sql_query(quote_table_refs(sql, table_name), con), None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        con.close()
+
+
 def validate_sql(sql: str, columns) -> list:
     """
     Cheap static checks so obvious mistakes surface before hitting SQLite.
@@ -175,6 +218,7 @@ def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
 # UI
 # ==========================================================================
 st.title("🗄️ Text-to-SQL")
+st.caption("Pipeline: decoder-level SQL constraints v5")
 st.caption("Ask a question in plain English. The model reads your table's schema and writes the SQL.")
 st.caption("Pipeline version: mandatory semantic inference v4")
 
