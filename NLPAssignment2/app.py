@@ -19,6 +19,7 @@ modelling logic of its own, only the interface and the execution layer.
 
 from __future__ import annotations
 
+import difflib
 import glob
 import io
 import os
@@ -236,6 +237,89 @@ def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
     return df, converted
 
 
+def ground_values(sql: str, df: pd.DataFrame, max_candidates: int = 2000):
+    """
+    Snap WHERE literals onto values that actually exist in the column.
+
+    The copy mechanism grabs a span from the question and often takes too much:
+    "How many cars have fuel type Petrol?" becomes
+    `WHERE "fuel type" = 'fuel type petrol'`, which matches nothing because the
+    column contains 'Petrol'. The question words and the column name sit next
+    to each other, so the model cannot tell where the value starts.
+
+    The uploaded table is the ground truth, so the literal can be checked
+    against the column's real contents and corrected. Three strategies, most
+    conservative first:
+
+      1. exact (case-insensitive)          -> already correct, leave alone
+      2. a real value occurs INSIDE the    -> the over-copy case above
+         predicted literal (or vice versa)
+      3. close string match (>= 0.8)       -> typo / minor drift
+
+    Anything below that is left untouched: a wrong substitution is worse than
+    no substitution, because it turns a visibly empty result into a
+    confidently wrong one.
+    """
+    subs = []
+
+    def fix(m):
+        col, op, val = m.group(1), m.group(2), m.group(3)
+        key = col.lower()
+        if key not in {str(c).lower() for c in df.columns}:
+            return m.group(0)
+        series = df[[c for c in df.columns if str(c).lower() == key][0]]
+        if series.dtype.kind in "ifb":
+            return m.group(0)                       # numeric: nothing to snap
+        uniq = series.dropna().astype(str).unique()
+        if len(uniq) == 0 or len(uniq) > max_candidates:
+            return m.group(0)                       # free text, not a category
+
+        low = {u.lower(): u for u in uniq}
+        v = val.strip().lower()
+        if v in low:
+            return m.group(0)                       # already exact
+
+        # 2. containment - longest real value inside the predicted literal
+        inside = [u for u in uniq if u.lower() in v]
+        if not inside:
+            inside = [u for u in uniq if v and v in u.lower()]
+        if inside:
+            best = max(inside, key=len)
+            subs.append((val, best, col))
+            return f'"{col}" {op} \'{best}\''
+
+        # 3. fuzzy
+        close = difflib.get_close_matches(v, list(low), n=1, cutoff=0.8)
+        if close:
+            best = low[close[0]]
+            subs.append((val, best, col))
+            return f'"{col}" {op} \'{best}\''
+        return m.group(0)
+
+    out = re.sub(r'"([^"]+)"\s*(=|<>|!=)\s*\'([^\']*)\'', fix, sql)
+    return out, subs
+
+
+def count_star_repair(sql: str, question: str, df: pd.DataFrame):
+    """
+    Turn COUNT("some column") into COUNT(*) when the question never mentions
+    that column.
+
+    `COUNT(col)` skips NULLs, so counting a sparsely-populated column silently
+    undercounts - on used_cars_data.csv, COUNT("new price") would report 1,006
+    where COUNT(*) reports 7,253. When the user asked a plain "how many",
+    COUNT(*) is what they meant.
+    """
+    m = re.search(r'COUNT\(\s*"([^"]+)"\s*\)', sql, re.I)
+    if not m:
+        return sql, None
+    col = m.group(1)
+    q = question.lower()
+    if all(w in q for w in col.lower().split()):
+        return sql, None                            # user really named it
+    return sql[:m.start()] + "COUNT(*)" + sql[m.end():], col
+
+
 def _sqlite_type(dtype) -> str:
     k = getattr(dtype, "kind", "O")
     if k in "iu":
@@ -328,6 +412,14 @@ with st.sidebar:
                               "WHERE \"city\" = 'mumbai' matches 'Mumbai'. "
                               "The model lowercases everything, so without "
                               "this most WHERE clauses return zero rows.")
+    ground = st.checkbox("Ground values against the table", value=True,
+                         help="Snaps a WHERE value onto a value that actually "
+                              "exists in that column, fixing over-copying like "
+                              "'fuel type petrol' -> 'Petrol'.")
+    count_star = st.checkbox("Prefer COUNT(*) for \"how many\"", value=True,
+                             help="COUNT(col) skips NULLs and undercounts. "
+                                  "Rewrites to COUNT(*) unless the question "
+                                  "names that column.")
     constrain = st.checkbox("Restrict columns to the schema", value=True,
                             help="Forces every generated column name to be a "
                                  "real column. Without it the model emits "
@@ -439,6 +531,19 @@ if go:
         sql, src_tokens, out_tokens, attn = generate(
             model, src_vocab, tgt_vocab, question, MODEL_TABLE, columns,
             beam, max_len, device, constrain)
+    notes = []
+    if df is not None:
+        if ground:
+            sql, subs = ground_values(sql, df)
+            notes += [f"value `{a}` -> `{b}` (real value in `{c}`)"
+                      for a, b, c in subs]
+        if count_star:
+            sql, replaced = count_star_repair(sql, question, df)
+            if replaced:
+                notes.append(f"`COUNT(\"{replaced}\")` -> `COUNT(*)` "
+                             "(column not mentioned in the question; "
+                             "COUNT(col) skips NULLs)")
+    st.session_state["post"] = notes
     st.session_state["sql"] = sql
     st.session_state["editor"] = sql        # new generation replaces the editor
     st.session_state["src_tokens"] = src_tokens
@@ -448,6 +553,8 @@ if go:
 if "sql" in st.session_state:
     st.subheader("3 · Generated SQL")
     st.code(st.session_state["sql"], language="sql")
+    for note in st.session_state.get("post", []):
+        st.caption("🔧 post-processing: " + note)
 
     with st.expander("How the model read your input"):
         st.write("**Encoder input** (question + serialised schema)")
