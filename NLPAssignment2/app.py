@@ -339,10 +339,9 @@ examples = [
     "Show the name of the employee with the highest salary",
     "Count the records where the status is shipped",
 ]
-ex = st.selectbox("Example questions", ["—"] + examples)
+st.caption("Example questions: " + " | ".join(examples))
 question = st.text_input(
     "Question",
-    value="" if ex == "—" else ex,
     placeholder="e.g. what is the average salary in the sales department?",
     label_visibility="collapsed")
 
