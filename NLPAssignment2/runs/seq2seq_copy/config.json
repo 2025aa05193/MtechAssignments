@@ -25,7 +25,7 @@
   "device": "cuda",
   "run_name": "seq2seq_copy",
   "notes": "",
-  "param_count": 41631385,
-  "src_vocab_size": 25248,
+  "param_count": 40021913,
+  "src_vocab_size": 18961,
   "tgt_vocab_size": 15000
 }
