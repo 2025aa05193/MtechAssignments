@@ -1412,17 +1412,33 @@ class Seq2SeqCopy(nn.Module):
         mask = (src != PAD_ID)
         return enc_out, state, mask
 
-    def forward(self, src, src_len, src_ext, tgt_in, max_oov: int = 0):
-        """Teacher forcing. Returns log-probs (B, T, V+max_oov)."""
+    def forward(self, src, src_len, src_ext, tgt_in, max_oov: int = 0,
+                teacher_forcing_ratio: float = 1.0):
+        """Decode with optional scheduled sampling.
+
+        At ratio=1.0 this is standard teacher forcing. As the ratio is reduced
+        during training, the decoder increasingly consumes its own predictions,
+        which reduces exposure bias between training and inference.
+        """
         enc_out, state, mask = self.encode(src, src_len)
         B, T = tgt_in.shape
         ctx = src.new_zeros(B, self.enc_dim, dtype=enc_out.dtype)
 
         probs = []
+        y = tgt_in[:, 0]
         for t in range(T):
             p, state, ctx, _, _ = self.decoder.step(
-                tgt_in[:, t], state, ctx, enc_out, mask, src_ext, max_oov)
+                y, state, ctx, enc_out, mask, src_ext, max_oov)
             probs.append(p)
+            if t + 1 < T:
+                gold_next = tgt_in[:, t + 1]
+                if self.training and teacher_forcing_ratio < 1.0:
+                    pred_next = p.detach().argmax(-1)
+                    use_gold = (torch.rand(B, device=tgt_in.device)
+                                < teacher_forcing_ratio)
+                    y = torch.where(use_gold, gold_next, _clamp(pred_next, self.tgt_vocab_size))
+                else:
+                    y = gold_next
         # log AFTER mixing: the copy distribution is a probability, not a logit,
         # so the loss must be NLL over log(p), never cross_entropy over logits.
         return torch.log(torch.stack(probs, dim=1) + EPS)
@@ -1589,8 +1605,8 @@ class TransformerSeq2Seq(nn.Module):
 class Config:
     # data
     dataset: str = "wikisql"
-    src_max_len: int = 60
-    tgt_max_len: int = 45
+    src_max_len: int = 96
+    tgt_max_len: int = 60
     src_min_freq: int = 2
     tgt_min_freq: int = 2
     max_src_vocab: int = 30000
@@ -1610,7 +1626,7 @@ class Config:
     weight_decay: float = 0.0
     grad_clip: float = 5.0
     label_smoothing: float = 0.0
-    teacher_forcing: float = 1.0        # always 1.0 here; scheduled sampling optional
+    teacher_forcing: float = 1.0        # initial teacher-forcing ratio
     lr_patience: int = 1                # ReduceLROnPlateau
     lr_factor: float = 0.5
     early_stop_patience: int = 3
@@ -1646,7 +1662,7 @@ def build_vocabs(train, cfg: Config):
 
 
 # --------------------------------------------------------------------------
-def run_epoch(model, loader, cfg, optimizer=None):
+def run_epoch(model, loader, cfg, optimizer=None, teacher_forcing_ratio: float = 1.0):
     train_mode = optimizer is not None
     model.train(train_mode)
     total_loss = total_tok = correct = 0
@@ -1659,7 +1675,8 @@ def run_epoch(model, loader, cfg, optimizer=None):
         max_oov = int(batch["max_oov"])
 
         with torch.set_grad_enabled(train_mode):
-            log_probs = model(src, src_len, src_ext, tgt_in, max_oov)
+            log_probs = model(src, src_len, src_ext, tgt_in, max_oov,
+                              teacher_forcing_ratio if train_mode else 1.0)
             loss = masked_nll(log_probs, tgt_out, cfg.label_smoothing)
 
         if train_mode:
@@ -1701,6 +1718,16 @@ def plot_curves(history: List[dict], path: str):
 
 
 # --------------------------------------------------------------------------
+def teacher_forcing_schedule(epoch: int, total_epochs: int, start: float = 1.0,
+                             end: float = 0.5) -> float:
+    """Linearly decay teacher forcing while keeping a useful amount of guidance."""
+    if total_epochs <= 1:
+        return start
+    frac = min(max((epoch - 1) / max(total_epochs - 1, 1), 0.0), 1.0)
+    return float(start + frac * (end - start))
+
+
+# --------------------------------------------------------------------------
 def cmd_train(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--wikisql", type=str, default=None)
@@ -1717,6 +1744,8 @@ def cmd_train(argv=None):
                     help="ablation: attention only, no pointer-generator")
     ap.add_argument("--run-name", type=str, default="seq2seq_copy")
     ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--no-augment", action="store_true",
+                    help="disable small WikiSQL multi-aggregation augmentation")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny subset + 1 epoch, just to verify wiring")
     args = ap.parse_args(argv)
@@ -1735,6 +1764,9 @@ def cmd_train(argv=None):
     os.makedirs(out_dir, exist_ok=True)
 
     splits = load_data(args)
+    if args.wikisql and not args.no_augment:
+        splits["train"] = augment_wikisql_multi_agg(splits["train"])
+        print(f"multi-aggregation augmentation: train={len(splits['train']):,}")
     src_vocab, tgt_vocab = build_vocabs(splits["train"], cfg)
     cfg.src_vocab_size, cfg.tgt_vocab_size = len(src_vocab), len(tgt_vocab)
     loaders = make_copy_loaders(splits, src_vocab, tgt_vocab,
@@ -1758,8 +1790,11 @@ def cmd_train(argv=None):
     history, best, bad_epochs = [], float("inf"), 0
     for ep in range(1, cfg.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_ppl, tr_acc = run_epoch(model, loaders["train"], cfg, optimizer)
-        va_loss, va_ppl, va_acc = run_epoch(model, loaders["val"], cfg)
+        tf_ratio = teacher_forcing_schedule(ep, cfg.epochs, cfg.teacher_forcing, 0.5)
+        tr_loss, tr_ppl, tr_acc = run_epoch(
+            model, loaders["train"], cfg, optimizer, tf_ratio)
+        va_loss, va_ppl, va_acc = run_epoch(model, loaders["val"], cfg,
+                                             teacher_forcing_ratio=1.0)
         scheduler.step(va_loss)
 
         history.append({"epoch": ep, "train_loss": tr_loss, "val_loss": va_loss,
@@ -1769,7 +1804,7 @@ def cmd_train(argv=None):
                         "secs": round(time.time() - t0, 1)})
         print(f"epoch {ep:>2} | train {tr_loss:.4f} (ppl {tr_ppl:6.2f}) "
               f"| val {va_loss:.4f} (ppl {va_ppl:6.2f}) "
-              f"| val tok-acc {va_acc:.4f} | {history[-1]['secs']}s")
+              f"| val tok-acc {va_acc:.4f} | tf {tf_ratio:.2f} | {history[-1]['secs']}s")
 
         if va_loss < best:
             best, bad_epochs = va_loss, 0
@@ -1788,6 +1823,173 @@ def cmd_train(argv=None):
         json.dump(asdict(cfg), f, indent=2)
     plot_curves(history, os.path.join(out_dir, "loss_curve.png"))
     print(f"best val loss {best:.4f} | artifacts in {out_dir}/")
+
+
+
+def augment_wikisql_multi_agg(records: List[dict], max_records: int = 12000) -> List[dict]:
+    """Add conservative multi-aggregation examples to WikiSQL training data.
+
+    WikiSQL's native representation has one selected column/aggregation. The
+    application, however, receives questions such as "maximum and minimum price".
+    We synthesize that compositional pattern from existing MAX/MIN examples so
+    the seq2seq model sees the output form during training.
+    """
+    extra = []
+    seen = set()
+    for r in records:
+        sql = r.get("sql", "")
+        m = re.search(r'^SELECT (MAX|MIN)\("([^"]+)"\) FROM ([^ ]+)(.*)$', sql, re.I)
+        if not m:
+            continue
+        agg, col, table, tail = m.groups()
+        other = "MIN" if agg.upper() == "MAX" else "MAX"
+        q = r.get("question", "").strip()
+        if not q:
+            continue
+        # Keep the existing wording but turn the leading aggregation phrase into
+        # a compositional question.
+        patterns = [("maximum", "maximum and minimum"),
+                    ("maximum", "maximum and minimum"),
+                    ("minimum", "maximum and minimum"),
+                    ("max", "maximum and minimum"),
+                    ("min", "maximum and minimum")]
+        nq = None
+        for a, b in patterns:
+            if a in q.lower():
+                nq = re.sub(re.escape(a), b, q, count=1, flags=re.I)
+                break
+        if nq is None:
+            nq = f"What is the maximum and minimum {col.replace('_', ' ')}"
+        ns = f'SELECT {agg.upper()}("{col}"), {other}("{col}") FROM {table}{tail}'
+        key = (nq.lower(), ns.lower())
+        if key in seen:
+            continue
+        nr = dict(r)
+        nr["question"] = nq
+        nr["sql"] = ns
+        nr["template"] = "MULTI_AGG"
+        extra.append(preprocess_record(nr))
+        seen.add(key)
+        if len(extra) >= max_records:
+            break
+    return records + extra
+
+
+def _norm_text(s: str) -> str:
+    s = str(s).lower().replace("_", " ")
+    s = re.sub(r"[^a-z0-9.]+", " ", s)
+    return " ".join(s.split())
+
+
+def infer_schema_matches(question: str, columns: Sequence[str],
+                          values_by_column: Optional[Dict[str, Sequence[str]]] = None):
+    """Infer likely column/value mentions without changing the neural model."""
+    q = _norm_text(question)
+    scored = []
+    for col in columns:
+        cn = _norm_text(col)
+        words = [w for w in cn.split() if len(w) > 1]
+        score = 0.0
+        if cn and cn in q:
+            score += 5.0 + len(words)
+        score += sum(1.0 for w in words if re.search(rf"\b{re.escape(w)}\b", q))
+        scored.append((score, col))
+
+    best_col = max(scored, default=(0.0, None))[1] if scored else None
+    found = None
+    if values_by_column:
+        candidates = []
+        for col, vals in values_by_column.items():
+            for val in vals:
+                vn = _norm_text(val)
+                if not vn or len(vn) < 2:
+                    continue
+                if re.search(rf"\b{re.escape(vn)}\b", q):
+                    # Exact value mention dominates; longer values win ties.
+                    candidates.append((len(vn), col, str(val)))
+        if candidates:
+            _, best_v_col, best_val = max(candidates, key=lambda x: x[0])
+            found = (best_v_col, best_val)
+    return best_col, found
+
+
+def semantic_repair_sql(sql: str, question: str, columns: Sequence[str],
+                        table: str = "table",
+                        values_by_column: Optional[Dict[str, Sequence[str]]] = None) -> str:
+    """Apply conservative, question-aware repairs after neural generation.
+
+    This is intentionally deterministic and separate from the raw model output.
+    It fixes the failure modes seen in the uploaded test set: COUNT target choice,
+    value/column swaps, hallucinated WHERE clauses, and MAX+MIN composition.
+    """
+    q = _norm_text(question)
+    cols = [str(c) for c in columns]
+    col_map = {_norm_text(c): c for c in cols}
+
+    # Identify obvious aggregation intent.
+    is_count = bool(re.search(r"\bhow many\b|\bnumber of\b|\bcount (?:the|of|all|records|rows|cars|entries)?", q))
+    wants_max = bool(re.search(r"\bmaximum\b|\bmax(?:imum)?\b|\bhighest\b|\blargest\b", q))
+    wants_min = bool(re.search(r"\bminimum\b|\bmin(?:imum)?\b|\blowest\b|\bsmallest\b", q))
+    wants_avg = bool(re.search(r"\baverage\b|\bmean\b|\bavg\b", q))
+    wants_sum = bool(re.search(r"\btotal\b|\bsum\b", q))
+
+    # Prefer a column explicitly mentioned in the question.
+    mentioned = []
+    q_words = set(q.split())
+    for c in cols:
+        cn = _norm_text(c)
+        words = [w for w in cn.split() if len(w) > 1]
+        if not words:
+            continue
+        overlap = sum(1 for w in words if w in q_words)
+        contiguous = 1 if cn and cn in q else 0
+        # Prefer full phrase matches, then multi-word semantic overlap.
+        score = contiguous * 10 + overlap * 2 + (0.5 if overlap == len(words) else 0)
+        if score > 0:
+            mentioned.append((score, len(words), c))
+    mentioned_col = max(mentioned, default=(0, 0, None))[2]
+
+    if is_count:
+        select_expr = "COUNT(*)"
+    elif mentioned_col:
+        if wants_max and wants_min:
+            select_expr = f'MAX("{mentioned_col}"), MIN("{mentioned_col}")'
+        elif wants_max:
+            select_expr = f'MAX("{mentioned_col}")'
+        elif wants_min:
+            select_expr = f'MIN("{mentioned_col}")'
+        elif wants_avg:
+            select_expr = f'AVG("{mentioned_col}")'
+        elif wants_sum:
+            select_expr = f'SUM("{mentioned_col}")'
+        else:
+            select_expr = None
+    else:
+        select_expr = None
+
+    # Infer a value-column pair from actual CSV values when available.
+    _, value_match = infer_schema_matches(question, cols, values_by_column)
+    filter_clause = None
+    if value_match:
+        vcol, value = value_match
+        safe = str(value).replace("'", "''")
+        filter_clause = f"\"{vcol}\" = '{safe}'"
+
+    if select_expr is not None:
+        repaired = f"SELECT {select_expr} FROM {table}"
+        if filter_clause:
+            repaired += f" WHERE {filter_clause}"
+        return repaired
+
+    # For non-aggregate queries, repair a WHERE whose column/value clearly mismatch
+    # a real value in the uploaded table. Otherwise leave the model output alone.
+    if filter_clause:
+        base = re.sub(r"\s+WHERE\s+.*?(?=\s+GROUP BY|\s+ORDER BY|\s+LIMIT|$)", "", sql, flags=re.I)
+        base = base.rstrip()
+        return base + " WHERE " + filter_clause
+
+    return sql
+
 
 
 

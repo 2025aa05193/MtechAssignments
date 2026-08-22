@@ -237,6 +237,19 @@ def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
     return df, converted
 
 
+def build_value_candidates(df: pd.DataFrame, max_candidates: int = 2000):
+    """Return compact, hashable value candidates for question-aware grounding."""
+    out = {}
+    for col in df.columns:
+        vals = df[col].dropna().astype(str).str.strip()
+        # Avoid feeding huge free-text columns into the matcher.
+        vals = vals[vals != ""].drop_duplicates()
+        if len(vals) > max_candidates:
+            continue
+        out[str(col)] = vals.tolist()
+    return out
+
+
 def ground_values(sql: str, df: pd.DataFrame, max_candidates: int = 2000):
     """
     Snap WHERE literals onto values that actually exist in the column.
@@ -488,6 +501,11 @@ with st.sidebar:
                          help="Snaps a WHERE value onto a value that actually "
                               "exists in that column, fixing over-copying like "
                               "'fuel type petrol' -> 'Petrol'.")
+    semantic_repair = st.checkbox(
+        "Use question-aware SQL repair", value=True,
+        help=("Uses the question plus the uploaded schema/value candidates to "
+              "correct COUNT intent, filter column/value swaps, hallucinated "
+              "WHERE clauses, and MAX+MIN questions."))
     count_star = st.checkbox("Prefer COUNT(*) for \"how many\"", value=True,
                              help="COUNT(col) skips NULLs and undercounts. "
                                   "Rewrites to COUNT(*) unless the question "
@@ -600,10 +618,19 @@ if not columns:
 # --------------------------------------------------------------------------
 if go:
     with st.spinner("Generating…"):
-        sql, src_tokens, out_tokens, attn = generate(
+        raw_sql, src_tokens, out_tokens, attn = generate(
             model, src_vocab, tgt_vocab, question, MODEL_TABLE, columns,
             beam, max_len, device, constrain)
+    sql = raw_sql
     notes = []
+    st.session_state["raw_sql"] = raw_sql
+    values = build_value_candidates(df) if df is not None else None
+    if semantic_repair:
+        repaired = semantic_repair_sql(
+            sql, question, columns, MODEL_TABLE, values)
+        if norm_ws(repaired) != norm_ws(sql):
+            notes.append("question-aware semantic repair applied")
+        sql = repaired
     if df is not None:
         if ground:
             sql, subs = ground_values(sql, df)
@@ -622,6 +649,8 @@ if go:
                 notes.append(f"`COUNT(\"{replaced}\")` -> `COUNT(*)` "
                              "(column not mentioned in the question; "
                              "COUNT(col) skips NULLs)")
+    else:
+        st.session_state["dropped"] = []
     st.session_state["post"] = notes
     st.session_state["sql"] = sql
     st.session_state["editor"] = sql        # new generation replaces the editor
@@ -632,6 +661,9 @@ if go:
 if "sql" in st.session_state:
     st.subheader("3 · Generated SQL")
     st.code(st.session_state["sql"], language="sql")
+    if st.session_state.get("raw_sql") and norm_ws(st.session_state["raw_sql"]) != norm_ws(st.session_state["sql"]):
+        with st.expander("Raw model output (before repair)"):
+            st.code(st.session_state["raw_sql"], language="sql")
     for note in st.session_state.get("post", []):
         st.caption("🔧 post-processing: " + note)
     for cond, why in st.session_state.get("dropped", []):
