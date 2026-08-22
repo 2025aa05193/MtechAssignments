@@ -22,6 +22,7 @@ from __future__ import annotations
 import difflib
 import glob
 import io
+from datetime import datetime
 import os
 import re
 import sqlite3
@@ -29,6 +30,8 @@ import tempfile
 
 import pandas as pd
 import streamlit as st
+
+from evaluation import SessionLog, assess, bleu, component_scores, exact_match
 import torch
 
 from text2sql import (Vocab, load_checkpoint, quote_table_refs,
@@ -371,6 +374,7 @@ if go:
     st.session_state["post"] = ["decoder-level question/SQL constraints enforced"]
     st.session_state["sql"] = sql
     st.session_state["editor"] = sql
+    st.session_state["last_question"] = question
     st.session_state["src_tokens"] = src_tokens
     st.session_state["out_tokens"] = out_tokens
     st.session_state["attn"] = attn
@@ -468,6 +472,87 @@ if "sql" in st.session_state:
             for i, (q, n) in enumerate(reversed(st.session_state["history"][-10:]), 1):
                 st.code(q, language="sql")
                 st.caption(f"{n:,} row(s)")
+
+# ==========================================================================
+# 5 · Assessment
+# ==========================================================================
+if "sql" in st.session_state:
+    st.subheader("5 · Assess this query")
+
+    log: SessionLog = st.session_state.setdefault("eval_log", SessionLog())
+
+    st.caption("Exact match, component accuracy and BLEU compare the generated "
+               "SQL against a **reference** query. Supply one below to score "
+               "them; leave it blank and only execution results are recorded "
+               "(they are reported as *n/a*, never as zero).")
+
+    reference = st.text_area(
+        "Reference SQL (optional) — what the query should have been",
+        key="reference_sql", height=80,
+        placeholder='SELECT COUNT(*) FROM table WHERE "fuel type" = \'CNG\'')
+
+    if st.button("➕ Assess and add to log"):
+        current = st.session_state.get("editor") or st.session_state["sql"]
+        row = assess(
+            question=st.session_state.get("last_question", ""),
+            predicted_sql=current,
+            reference_sql=(reference or "").strip() or None,
+            df=df,
+            runner=(lambda d, q, t: run_sql(d, q, t, nocase)) if df is not None else None,
+            table_name=MODEL_TABLE,
+            extra={"decoding": "beam" if beam > 1 else "greedy",
+                   "beam_size": beam, "table": table_name},
+        )
+        log.add(row)
+        st.session_state["last_assessment"] = row
+
+    row = st.session_state.get("last_assessment")
+    if row:
+        def show(v, pct=False):
+            if v is None:
+                return "n/a"
+            return f"{v:.0%}" if pct else (f"{v:.4f}" if isinstance(v, float) else str(v))
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Exact match", show(row["exact_match"], True))
+        m2.metric("Component avg", show(row["component_average"], True))
+        m3.metric("Execution match", show(row["execution_match"], True))
+        m4.metric("BLEU", show(row["bleu"]))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("SELECT column", show(row["select_column_correct"], True))
+        c2.metric("Aggregate", show(row["aggregate_correct"], True))
+        c3.metric("WHERE clause", show(row["where_clause_correct"], True))
+        if row.get("error"):
+            st.warning(f"Execution: {row['error']}")
+        if row["exact_match"] is None:
+            st.info("No reference given — accuracy metrics are *n/a*. "
+                    "Executed: "
+                    f"{'yes' if row['executed'] else 'no'}"
+                    + (f", {row['rows_returned']:,} row(s)"
+                       if row["rows_returned"] is not None else ""))
+
+    if len(log):
+        st.markdown(f"**Session log — {len(log)} quer"
+                    f"{'y' if len(log) == 1 else 'ies'} assessed**")
+        summary = log.summary()
+        st.dataframe(pd.DataFrame([summary]), width='stretch', hide_index=True)
+        with st.expander("All assessments"):
+            st.dataframe(pd.DataFrame(log.rows), width='stretch', hide_index=True)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        d1, d2, d3 = st.columns(3)
+        d1.download_button("⬇ CSV", log.to_csv(),
+                           file_name=f"sql_assessment_{stamp}.csv",
+                           mime="text/csv")
+        d2.download_button("⬇ JSON (with summary)", log.to_json(),
+                           file_name=f"sql_assessment_{stamp}.json",
+                           mime="application/json")
+
+        def _clear_log():
+            st.session_state["eval_log"] = SessionLog()
+            st.session_state.pop("last_assessment", None)
+        d3.button("Clear log", on_click=_clear_log)
+
 
 st.divider()
 st.caption("Encoder–Decoder (BiLSTM + Bahdanau attention + pointer-generator "
