@@ -19,7 +19,6 @@ modelling logic of its own, only the interface and the execution layer.
 
 from __future__ import annotations
 
-import difflib
 import glob
 import io
 import os
@@ -34,7 +33,8 @@ import torch
 from text2sql import (SOS_ID, UNK_ID, EOS_ID, Vocab, beam_decode,
                       build_extended, build_source_sequence, detokenize_sql,
                       greedy_decode, load_checkpoint, outputids_to_tokens,
-                      quote_table_refs, build_column_trie, repair_sql)
+                      quote_table_refs, build_column_trie, repair_sql,
+                      predict_sql, predict_sql_with_values)
 
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
 
@@ -237,169 +237,6 @@ def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
     return df, converted
 
 
-def build_value_candidates(df: pd.DataFrame, max_candidates: int = 2000):
-    """Return compact, hashable value candidates for question-aware grounding."""
-    out = {}
-    for col in df.columns:
-        vals = df[col].dropna().astype(str).str.strip()
-        # Avoid feeding huge free-text columns into the matcher.
-        vals = vals[vals != ""].drop_duplicates()
-        if len(vals) > max_candidates:
-            continue
-        out[str(col)] = vals.tolist()
-    return out
-
-
-def ground_values(sql: str, df: pd.DataFrame, max_candidates: int = 2000):
-    """
-    Snap WHERE literals onto values that actually exist in the column.
-
-    The copy mechanism grabs a span from the question and often takes too much:
-    "How many cars have fuel type Petrol?" becomes
-    `WHERE "fuel type" = 'fuel type petrol'`, which matches nothing because the
-    column contains 'Petrol'. The question words and the column name sit next
-    to each other, so the model cannot tell where the value starts.
-
-    The uploaded table is the ground truth, so the literal can be checked
-    against the column's real contents and corrected. Three strategies, most
-    conservative first:
-
-      1. exact (case-insensitive)          -> already correct, leave alone
-      2. a real value occurs INSIDE the    -> the over-copy case above
-         predicted literal (or vice versa)
-      3. close string match (>= 0.8)       -> typo / minor drift
-
-    Anything below that is left untouched: a wrong substitution is worse than
-    no substitution, because it turns a visibly empty result into a
-    confidently wrong one.
-    """
-    subs = []
-
-    def fix(m):
-        col, op, val = m.group(1), m.group(2), m.group(3)
-        key = col.lower()
-        if key not in {str(c).lower() for c in df.columns}:
-            return m.group(0)
-        series = df[[c for c in df.columns if str(c).lower() == key][0]]
-        if series.dtype.kind in "ifb":
-            return m.group(0)                       # numeric: nothing to snap
-        uniq = series.dropna().astype(str).unique()
-        if len(uniq) == 0 or len(uniq) > max_candidates:
-            return m.group(0)                       # free text, not a category
-
-        low = {u.lower(): u for u in uniq}
-        v = val.strip().lower()
-        if v in low:
-            return m.group(0)                       # already exact
-
-        # 2. containment - longest real value inside the predicted literal
-        inside = [u for u in uniq if u.lower() in v]
-        if not inside:
-            inside = [u for u in uniq if v and v in u.lower()]
-        if inside:
-            best = max(inside, key=len)
-            subs.append((val, best, col))
-            return f'"{col}" {op} \'{best}\''
-
-        # 3. fuzzy
-        close = difflib.get_close_matches(v, list(low), n=1, cutoff=0.8)
-        if close:
-            best = low[close[0]]
-            subs.append((val, best, col))
-            return f'"{col}" {op} \'{best}\''
-        return m.group(0)
-
-    out = re.sub(r'"([^"]+)"\s*(=|<>|!=)\s*\'([^\']*)\'', fix, sql)
-    return out, subs
-
-
-def count_star_repair(sql: str, question: str, df: pd.DataFrame):
-    """
-    Turn COUNT("some column") into COUNT(*) when the question never mentions
-    that column.
-
-    `COUNT(col)` skips NULLs, so counting a sparsely-populated column silently
-    undercounts - on used_cars_data.csv, COUNT("new price") would report 1,006
-    where COUNT(*) reports 7,253. When the user asked a plain "how many",
-    COUNT(*) is what they meant.
-    """
-    m = re.search(r'COUNT\(\s*"([^"]+)"\s*\)', sql, re.I)
-    if not m:
-        return sql, None
-    col = m.group(1)
-    q = question.lower()
-    if all(w in q for w in col.lower().split()):
-        return sql, None                            # user really named it
-    return sql[:m.start()] + "COUNT(*)" + sql[m.end():], col
-
-
-_COND_RE = re.compile(r'"([^"]+)"\s*(>=|<=|<>|!=|=|>|<)\s*(\'[^\']*\'|-?\d+(?:\.\d+)?)')
-
-
-def _column_of(df: pd.DataFrame, name: str):
-    for c in df.columns:
-        if str(c).lower() == name.lower():
-            return df[c]
-    return None
-
-
-def unsatisfiable_conditions(sql: str, df: pd.DataFrame,
-                             max_candidates: int = 2000) -> list:
-    """
-    Find WHERE conditions that provably match ZERO rows of the uploaded table.
-
-    The decoder sometimes appends a WHERE clause the question never asked for -
-    "What is the average kilometers a car has driven?" yields
-    `... WHERE "year" = 'driven'`. `year` holds integers, so that condition can
-    never be true, the query returns no rows, and AVG comes back NULL.
-
-    Only two cases count as PROVABLY unsatisfiable, both cheap and certain:
-      * a non-numeric literal compared against a numeric column
-      * an equality against a low-cardinality text column whose values do not
-        include the literal (checked case-insensitively, after grounding has
-        already had its chance to fix it)
-
-    High-cardinality / free-text columns are never judged, because absence
-    there is ordinary rather than evidence of a hallucinated clause.
-    """
-    out = []
-    for m in _COND_RE.finditer(sql):
-        col, op, raw = m.group(1), m.group(2), m.group(3)
-        series = _column_of(df, col)
-        if series is None:
-            continue
-        literal = raw[1:-1] if raw.startswith("'") else raw
-        is_num_literal = re.fullmatch(r"-?\d+(?:\.\d+)?", literal) is not None
-
-        if series.dtype.kind in "if":
-            if not is_num_literal:
-                out.append((m.group(0), f'"{col}" is numeric but the value '
-                                        f"'{literal}' is not a number"))
-            continue
-        if op != "=":
-            continue
-        uniq = series.dropna().astype(str).unique()
-        if len(uniq) == 0 or len(uniq) > max_candidates:
-            continue                      # free text: absence proves nothing
-        if literal.lower() not in {u.lower() for u in uniq}:
-            out.append((m.group(0), f"'{literal}' does not occur in "
-                                    f'"{col}" ({len(uniq)} distinct values)'))
-    return out
-
-
-def drop_conditions(sql: str, conditions) -> str:
-    """Remove the given condition strings, tidying up AND / WHERE around them."""
-    s = sql
-    for cond, _ in conditions:
-        s = s.replace(cond, "\x00")
-    s = re.sub(r"\s*\x00\s*AND\s+", " ", s)
-    s = re.sub(r"\s+AND\s*\x00\s*", " ", s)
-    s = re.sub(r"\bWHERE\s*\x00\s*", "", s)
-    s = s.replace("\x00", "")
-    s = re.sub(r"\bWHERE\s*(?=(GROUP|ORDER|LIMIT|HAVING)\b|$)", "", s, flags=re.I)
-    return " ".join(s.split()).strip()
-
-
 def _sqlite_type(dtype) -> str:
     k = getattr(dtype, "kind", "O")
     if k in "iu":
@@ -492,24 +329,6 @@ with st.sidebar:
                               "WHERE \"city\" = 'mumbai' matches 'Mumbai'. "
                               "The model lowercases everything, so without "
                               "this most WHERE clauses return zero rows.")
-    drop_unsat = st.checkbox("Drop impossible WHERE conditions", value=True,
-                             help="Removes a condition that provably matches "
-                                  "zero rows (e.g. a text value compared "
-                                  "against a numeric column). Changes the "
-                                  "query's meaning, so it is always reported.")
-    ground = st.checkbox("Ground values against the table", value=True,
-                         help="Snaps a WHERE value onto a value that actually "
-                              "exists in that column, fixing over-copying like "
-                              "'fuel type petrol' -> 'Petrol'.")
-    semantic_repair = st.checkbox(
-        "Use question-aware SQL repair", value=True,
-        help=("Uses the question plus the uploaded schema/value candidates to "
-              "correct COUNT intent, filter column/value swaps, hallucinated "
-              "WHERE clauses, and MAX+MIN questions."))
-    count_star = st.checkbox("Prefer COUNT(*) for \"how many\"", value=True,
-                             help="COUNT(col) skips NULLs and undercounts. "
-                                  "Rewrites to COUNT(*) unless the question "
-                                  "names that column.")
     constrain = st.checkbox("Restrict columns to the schema", value=True,
                             help="Forces every generated column name to be a "
                                  "real column. Without it the model emits "
@@ -621,39 +440,29 @@ if go:
         raw_sql, src_tokens, out_tokens, attn = generate(
             model, src_vocab, tgt_vocab, question, MODEL_TABLE, columns,
             beam, max_len, device, constrain)
-    sql = raw_sql
-    notes = []
+
+        # The complete semantic SQL layer now lives in text2sql.py.
+        # Streamlit only passes the uploaded rows into that pipeline.
+        if df is not None:
+            sql = predict_sql_with_values(
+                model, question, MODEL_TABLE, columns,
+                df.to_dict(orient="records"), src_vocab, tgt_vocab,
+                beam=beam, max_len=max_len, device=device,
+                constrain_columns=constrain)
+        else:
+            sql = predict_sql(
+                model, question, MODEL_TABLE, columns, src_vocab, tgt_vocab,
+                beam=beam, max_len=max_len, device=device,
+                constrain_columns=constrain, values_by_column=None,
+                apply_semantic=True)
+
     st.session_state["raw_sql"] = raw_sql
-    values = build_value_candidates(df) if df is not None else None
-    if semantic_repair:
-        repaired = semantic_repair_sql(
-            sql, question, columns, MODEL_TABLE, values)
-        if norm_ws(repaired) != norm_ws(sql):
-            notes.append("question-aware semantic repair applied")
-        sql = repaired
-    if df is not None:
-        if ground:
-            sql, subs = ground_values(sql, df)
-            notes += [f"value `{a}` -> `{b}` (real value in `{c}`)"
-                      for a, b, c in subs]
-        if drop_unsat:
-            bad = unsatisfiable_conditions(sql, df)
-            if bad:
-                sql = drop_conditions(sql, bad)
-                st.session_state["dropped"] = bad
-            else:
-                st.session_state["dropped"] = []
-        if count_star:
-            sql, replaced = count_star_repair(sql, question, df)
-            if replaced:
-                notes.append(f"`COUNT(\"{replaced}\")` -> `COUNT(*)` "
-                             "(column not mentioned in the question; "
-                             "COUNT(col) skips NULLs)")
-    else:
-        st.session_state["dropped"] = []
-    st.session_state["post"] = notes
     st.session_state["sql"] = sql
-    st.session_state["editor"] = sql        # new generation replaces the editor
+    st.session_state["post"] = (
+        ["mandatory model-side semantic SQL layer applied"]
+        if norm_ws(raw_sql) != norm_ws(sql) else []
+    )
+    st.session_state["editor"] = sql
     st.session_state["src_tokens"] = src_tokens
     st.session_state["out_tokens"] = out_tokens
     st.session_state["attn"] = attn
@@ -665,12 +474,7 @@ if "sql" in st.session_state:
         with st.expander("Raw model output (before repair)"):
             st.code(st.session_state["raw_sql"], language="sql")
     for note in st.session_state.get("post", []):
-        st.caption("🔧 post-processing: " + note)
-    for cond, why in st.session_state.get("dropped", []):
-        st.warning(f"Removed `{cond}` — {why}. This condition matched no rows, "
-                   "so the query would have returned nothing. **It changes what "
-                   "the query asks**; use Reset below if it was intended.")
-
+        st.caption("🧠 model pipeline: " + note)
     with st.expander("How the model read your input"):
         st.write("**Encoder input** (question + serialised schema)")
         st.code(" ".join(st.session_state["src_tokens"]), language="text")
