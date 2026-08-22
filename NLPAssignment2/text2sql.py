@@ -1811,7 +1811,43 @@ def cmd_train(argv=None):
 # accuracy while the loss still looks fine.
 
 # --------------------------------------------------------------------------
+def _check_checkpoint_file(path: str) -> None:
+    """
+    Explain what a non-checkpoint file actually is.
+
+    torch.load fails with `invalid load key, 'v'` on a Git LFS POINTER file -
+    a ~130 byte text stub starting `version https://git-lfs.github.com/spec/v1`
+    that a clone leaves behind when the LFS objects were never fetched. Other
+    common impostors: an HTML error page from a failed Drive/Dropbox download,
+    and a truncated file from a session that died mid-save. The raw pickle
+    error names none of these, so check the magic bytes first.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No checkpoint at {path}")
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        head = f.read(64)
+
+    if head.startswith(b"version https://git-lfs"):
+        raise RuntimeError(
+            f"{path} is a Git LFS pointer ({size} bytes), not a checkpoint.\n"
+            "The real weights were never fetched. Run:\n"
+            "    git lfs install && git lfs pull\n"
+            "If that fails, the object was never uploaded and the checkpoint "
+            "must be retrained or copied from wherever it was saved.")
+    if head.lstrip()[:1] in (b"<", b"{"):
+        raise RuntimeError(
+            f"{path} looks like an HTML or JSON page ({size} bytes), not a "
+            "checkpoint - usually a failed download that saved the error page. "
+            "Re-download the file.")
+    if size < 10000:
+        raise RuntimeError(
+            f"{path} is only {size} bytes - far too small for a checkpoint. "
+            "It is probably truncated (session died mid-save) or a placeholder.")
+
+
 def load_checkpoint(path: str, device: str = "cpu"):
+    _check_checkpoint_file(path)
     ck = torch.load(path, map_location=device, weights_only=False)
     cfg = ck["config"]
     src_vocab, tgt_vocab = Vocab(ck["src_vocab"]), Vocab(ck["tgt_vocab"])
@@ -2031,6 +2067,64 @@ def constrained_greedy_decode(model, src_ids, src_ext_ids, n_oov, columns,
 
 
 # --------------------------------------------------------------------------
+_KEYWORD_STOP = {"AND", "OR", "ORDER", "GROUP", "LIMIT", "HAVING", "WHERE",
+                 "FROM", "SELECT", "ASC", "DESC", "BY"}
+_CMP_OPS = {"=", ">", "<", ">=", "<=", "<>", "!="}
+
+
+def repair_sql(sql: str) -> str:
+    """
+    Quote comparison values the model left bare.
+
+    The decoder sometimes emits `WHERE "year" = mumbai` with no quotes. SQLite
+    then reads `mumbai` as a COLUMN REFERENCE and the query dies with
+    "no such column: mumbai" - so an otherwise near-miss prediction scores zero
+    on execution for a purely syntactic reason.
+
+    Bare NUMBERS are left alone: they are valid and common (3,960 of 22,480
+    gold conditions sampled from WikiSQL train are unquoted numerics).
+    """
+    toks = _SQL_TOKEN_RE.findall(sql)
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        out.append(t)
+        if t in _CMP_OPS and i + 1 < len(toks):
+            nxt = toks[i + 1]
+            already_quoted = nxt[:1] in ("'", '"')
+            numeric = re.fullmatch(r"-?\d+(?:\.\d+)?", nxt) is not None
+            if not already_quoted and not numeric:
+                # gather the bare value up to the next keyword / operator
+                j, val = i + 1, []
+                while j < len(toks):
+                    tj = toks[j]
+                    if tj.upper() in _KEYWORD_STOP or tj in _CMP_OPS \
+                            or tj[:1] in ("'", '"') or tj in (")", ","):
+                        break
+                    val.append(tj)
+                    j += 1
+                if val:
+                    out.append("'" + " ".join(val).replace("'", "") + "'")
+                    i = j
+                    continue
+        i += 1
+    # rejoin with detokenize_sql's own spacing rules so repair is a strict
+    # no-op on SQL that was already well formed
+    parts: List[str] = []
+    for tok in out:
+        prev = parts[-1] if parts else None
+        atomic = len(tok) >= 2 and tok[0] in ("'", '"')
+        glue = (prev is None
+                or (not atomic and tok in (")", ",", ";"))
+                or (not atomic and tok == "(" and prev
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", prev))
+                or prev == "(")
+        if not glue:
+            parts.append(" ")
+        parts.append(tok)
+    return "".join(parts).strip()
+
+
 def predict_sql(model, question: str, table: str, columns: Sequence[str],
                 src_vocab: Vocab, tgt_vocab: Vocab, beam: int = 1,
                 max_len: int = 45, device: str = "cpu",
@@ -2052,7 +2146,7 @@ def predict_sql(model, question: str, table: str, columns: Sequence[str],
                                         columns, tgt_vocab, oovs, max_len, device)
     else:
         ids = greedy_decode(model, src_ids, src_ext, len(oovs), max_len, device)
-    return detokenize_sql(outputids_to_tokens(ids, tgt_vocab, oovs))
+    return repair_sql(detokenize_sql(outputids_to_tokens(ids, tgt_vocab, oovs)))
 
 
 # --------------------------------------------------------------------------

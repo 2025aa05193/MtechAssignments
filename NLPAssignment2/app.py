@@ -33,7 +33,7 @@ import torch
 from text2sql import (SOS_ID, UNK_ID, EOS_ID, Vocab, beam_decode,
                       build_extended, build_source_sequence, detokenize_sql,
                       greedy_decode, load_checkpoint, outputids_to_tokens,
-                      quote_table_refs, build_column_trie)
+                      quote_table_refs, build_column_trie, repair_sql)
 
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
 
@@ -99,7 +99,9 @@ def generate(model, src_vocab, tgt_vocab, question, table, columns,
         ids, attn = _greedy_with_attention(model, src_ids, src_ext, len(oovs),
                                            max_len, device, trie, quote_id)
     tokens = outputids_to_tokens(ids, tgt_vocab, oovs)
-    return detokenize_sql(tokens), src_tokens, tokens, attn
+    # repair_sql quotes bare values ( = mumbai -> = 'mumbai' ), which SQLite
+    # would otherwise read as a column reference and reject
+    return repair_sql(detokenize_sql(tokens)), src_tokens, tokens, attn
 
 
 @torch.no_grad()
@@ -147,6 +149,40 @@ def _greedy_with_attention(model, src_ids, src_ext_ids, n_oov, max_len, device,
 # ==========================================================================
 # Execution layer
 # ==========================================================================
+def norm_ws(s: str) -> str:
+    return " ".join((s or "").split())
+
+
+def validate_sql(sql: str, columns) -> list:
+    """
+    Cheap static checks so obvious mistakes surface before hitting SQLite.
+    Advisory only - never blocks execution, because a wrong warning is worse
+    than no warning.
+    """
+    msgs, s = [], (sql or "").strip()
+    if not s:
+        return ["Query is empty."]
+    if s.count("'") % 2:
+        msgs.append("Odd number of single quotes - a string literal looks unclosed.")
+    if s.count('"') % 2:
+        msgs.append("Odd number of double quotes - an identifier looks unclosed.")
+    if s.count("(") != s.count(")"):
+        msgs.append("Unbalanced parentheses.")
+    if not re.match(r"^\s*(SELECT|WITH)\b", s, re.I):
+        msgs.append("Only SELECT queries can be run here.")
+    elif re.search(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER)\b", s, re.I):
+        msgs.append("Statement modifies data - it runs against the in-memory "
+                    "copy only, never your CSV file.")
+    known = {str(c).lower() for c in (columns or [])}
+    if known:
+        used = {m.lower() for m in re.findall(r'"([^"]+)"', s)}
+        unknown = sorted(u for u in used if u not in known and u != MODEL_TABLE)
+        if unknown:
+            msgs.append("Not a column in this table: "
+                        + ", ".join('"%s"' % u for u in unknown))
+    return msgs
+
+
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Make CSV headers look like the schema the model was trained on.
@@ -200,11 +236,49 @@ def strip_units(df: pd.DataFrame, min_ratio: float = 0.8) -> tuple:
     return df, converted
 
 
-def run_sql(df: pd.DataFrame, sql: str, table_name: str = MODEL_TABLE):
+def _sqlite_type(dtype) -> str:
+    k = getattr(dtype, "kind", "O")
+    if k in "iu":
+        return "INTEGER"
+    if k == "f":
+        return "REAL"
+    if k == "b":
+        return "INTEGER"
+    return "TEXT"
+
+
+def create_table(con: sqlite3.Connection, df: pd.DataFrame, table_name: str,
+                 nocase: bool = True) -> None:
+    """
+    Create the table explicitly so TEXT columns can be declared COLLATE NOCASE.
+
+    Preprocessing lowercases the question, so the model emits
+    `WHERE "fuel type" = 'cng'` while the CSV holds 'CNG'. SQLite's `=` is
+    case-sensitive, so that returns ZERO rows - a query that is semantically
+    right scores nothing. NOCASE on the column makes every comparison against
+    it case-insensitive, which fixes `=`, `IN` and `DISTINCT` without touching
+    the generated SQL.
+
+    Caveat: SQLite's NOCASE folds ASCII A-Z only, not accented characters, and
+    it also makes ORDER BY on those columns case-insensitive - which is
+    normally what a person wants anyway.
+    """
+    cols = []
+    for name, dtype in zip(df.columns, df.dtypes):
+        t = _sqlite_type(dtype)
+        collate = " COLLATE NOCASE" if (nocase and t == "TEXT") else ""
+        cols.append(f'"{name}" {t}{collate}')
+    con.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+    con.execute(f'CREATE TABLE "{table_name}" ({", ".join(cols)})')
+
+
+def run_sql(df: pd.DataFrame, sql: str, table_name: str = MODEL_TABLE,
+            nocase: bool = True):
     """Execute the query against the dataframe using an in-memory SQLite db."""
     con = sqlite3.connect(":memory:")
     try:
-        df.to_sql(table_name, con, index=False, if_exists="replace")
+        create_table(con, df, table_name, nocase)
+        df.to_sql(table_name, con, index=False, if_exists="append")
         # also register a couple of common aliases so a query that says
         # FROM data / FROM df still runs
         for alias in ("data", "df", "t"):
@@ -249,6 +323,11 @@ with st.sidebar:
     max_len = st.slider("Max SQL length (tokens)", 10, 80, 45)
     st.divider()
     auto_exec = st.checkbox("Execute query automatically", value=True)
+    nocase = st.checkbox("Case-insensitive text matching", value=True,
+                         help="Declares text columns COLLATE NOCASE so "
+                              "WHERE \"city\" = 'mumbai' matches 'Mumbai'. "
+                              "The model lowercases everything, so without "
+                              "this most WHERE clauses return zero rows.")
     constrain = st.checkbox("Restrict columns to the schema", value=True,
                             help="Forces every generated column name to be a "
                                  "real column. Without it the model emits "
@@ -361,6 +440,7 @@ if go:
             model, src_vocab, tgt_vocab, question, MODEL_TABLE, columns,
             beam, max_len, device, constrain)
     st.session_state["sql"] = sql
+    st.session_state["editor"] = sql        # new generation replaces the editor
     st.session_state["src_tokens"] = src_tokens
     st.session_state["out_tokens"] = out_tokens
     st.session_state["attn"] = attn
@@ -395,27 +475,67 @@ if "sql" in st.session_state:
     # ----------------------------------------------------------------------
     # 4. Execute
     # ----------------------------------------------------------------------
-    st.subheader("4 · Run it")
-    editable = st.text_area("Edit before running if needed",
-                            value=st.session_state["sql"], height=90)
+    st.subheader("4 · Edit and run")
+
+    # The editor MUST have a key. Without one, Streamlit re-seeds the widget
+    # from `value` on every rerun, so clicking Execute silently discarded the
+    # user's edits and re-ran the model's original SQL.
+    if "editor" not in st.session_state:
+        st.session_state["editor"] = st.session_state["sql"]
+
+    edited = st.text_area(
+        "SQL — edit freely, then run",
+        key="editor", height=110,
+        help="Fix a wrong column, add a GROUP BY, change the WHERE value — "
+             "anything. The query below is what actually runs.")
+
+    def _reset_editor():
+        # MUST be an on_click callback: Streamlit refuses to mutate a widget's
+        # session_state key after the widget has been instantiated this run.
+        # Callbacks execute before the script reruns, so this is legal.
+        st.session_state["editor"] = st.session_state["sql"]
+
+    c1, c2, c3 = st.columns([1, 1, 3])
+    run_clicked = c1.button("▶ Run query", type="primary")
+    c2.button("↺ Reset to generated", on_click=_reset_editor)
+
+    dirty = norm_ws(edited) != norm_ws(st.session_state["sql"])
+    if dirty:
+        c3.caption("✏️ edited — differs from the generated query")
+    else:
+        c3.caption("unmodified model output")
+
+    # cheap static checks before touching the database
+    problems = validate_sql(edited, columns)
+    for p in problems:
+        st.warning(p)
 
     if df is None:
         st.info("Upload a CSV to execute the query against real data.")
     else:
-        run = auto_exec or st.button("Execute")
-        if run:
-            result, err = run_sql(df, editable, MODEL_TABLE)
+        if run_clicked or (auto_exec and not dirty):
+            result, err = run_sql(df, edited, MODEL_TABLE, nocase)
             if err:
                 st.error(f"SQLite error: {err}")
-                st.caption("The model may have referenced a column that does "
-                           "not exist, or produced invalid syntax. Edit the "
-                           "query above and re-run.")
+                st.caption("Edit the query above and press Run query.")
             else:
-                st.success(f"{len(result):,} row(s) returned")
+                st.success(f"{len(result):,} row(s) returned"
+                           + (" · from your edited query" if dirty else ""))
                 st.dataframe(result, width='stretch')
                 st.download_button("Download result as CSV",
                                    result.to_csv(index=False).encode(),
                                    file_name="result.csv", mime="text/csv")
+                hist = st.session_state.setdefault("history", [])
+                if not hist or hist[-1][0] != edited:
+                    hist.append((edited, len(result)))
+        elif dirty:
+            st.info("Query edited — press **Run query** to execute it.")
+
+    if st.session_state.get("history"):
+        with st.expander(f"Query history ({len(st.session_state['history'])})"):
+            for i, (q, n) in enumerate(reversed(st.session_state["history"][-10:]), 1):
+                st.code(q, language="sql")
+                st.caption(f"{n:,} row(s)")
 
 st.divider()
 st.caption("Encoder–Decoder (BiLSTM + Bahdanau attention + pointer-generator "
