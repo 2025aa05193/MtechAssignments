@@ -1,5 +1,5 @@
 #### Link to Streamlit App-  https://nlpassignment2g250.streamlit.app/
-### Path to Sample CSV Dataset - NLPAssignment2/sample csv
+#### Path to Sample CSV Dataset - NLPAssignment2/sample csv
 
 # Text-to-SQL Application
 
