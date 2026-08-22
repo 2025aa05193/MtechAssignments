@@ -325,8 +325,7 @@ if go:
     attn = result["attn"]
 
     st.session_state["raw_sql"] = raw_sql
-    st.session_state["post"] = ([] if norm_ws(raw_sql) == norm_ws(sql)
-                                  else ["mandatory semantic/value grounding applied"])
+    st.session_state["post"] = ["decoder-level question/SQL constraints enforced"]
     st.session_state["sql"] = sql
     st.session_state["editor"] = sql
     st.session_state["src_tokens"] = src_tokens

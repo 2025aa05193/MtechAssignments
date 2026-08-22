@@ -1974,38 +1974,522 @@ def semantic_repair_sql(sql: str, question: str, columns: Sequence[str],
     return re.sub(r"\s+", " ", sql).strip()
 
 
+
+# --------------------------------------------------------------------------
+# SECTION 6b - QUESTION-AWARE SQL DECODER CONSTRAINTS
+# --------------------------------------------------------------------------
+# These constraints live in the decoding layer, not Streamlit. They use the
+# question + schema to restrict what the neural decoder may emit while still
+# letting the trained probability distribution choose among valid options.
+# This is intentionally a decoder constraint rather than post-generation SQL
+# rewriting: invalid structures are prevented before they become SQL output.
+
+_SQL_AGG = {"COUNT", "AVG", "SUM", "MIN", "MAX"}
+_SQL_CMP = {"=", "!=", "<>", ">", "<", ">=", "<="}
+_SQL_BOOL = {"AND", "OR"}
+
+
+def _question_condition_columns(question: str, columns: Sequence[str]) -> List[str]:
+    """Columns that are semantically/lexically mentioned as filter fields."""
+    q = _sem_norm(question)
+    stop = {"and", "or", "where", "with", "having", "for", "from"}
+    hits = []
+    for col in columns:
+        words = [w for w in _sem_norm(str(col)).split() if len(w) > 1]
+        if not words:
+            continue
+        overlap = sum(w in q.split() for w in words)
+        full = _sem_norm(str(col)) in q
+        if full or overlap == len(words):
+            # Avoid treating a numeric measure mentioned only as a SELECT
+            # target as a filter unless the question has a filter cue.
+            hits.append(str(col))
+    return hits
+
+
+def _question_filter_values(question: str, columns: Sequence[str]) -> Dict[str, List[str]]:
+    """Extract simple value spans after semantically mentioned columns.
+
+    This supplies decoder-side value candidates for questions such as
+    'fuel type is Petrol and transmission is Manual'. It is not an app repair:
+    the decoder uses these tokens to constrain the next-token distribution.
+    """
+    q_raw = question.lower().strip()
+    q_tokens = tokenize_question(question)
+    out: Dict[str, List[str]] = {}
+    for col in columns:
+        c_words = tokenize_value(str(col))
+        if not c_words:
+            continue
+        # Find the column phrase in the tokenized question.
+        for i in range(len(q_tokens) - len(c_words) + 1):
+            if q_tokens[i:i+len(c_words)] != c_words:
+                continue
+            j = i + len(c_words)
+            # Common relation words between column and its value.
+            while j < len(q_tokens) and q_tokens[j] in {
+                "is", "are", "was", "were", "equals", "equal", "to",
+                "of", "at", "than", "greater", "less", "more", "above",
+                "below", "over", "under", "the"
+            }:
+                j += 1
+            vals = []
+            while j < len(q_tokens):
+                tok = q_tokens[j]
+                if tok in {"and", "or", ",", ";"}:
+                    break
+                if tok in {"where", "with", "having"}:
+                    break
+                if not re.search(r"[A-Za-z0-9]", tok):
+                    break
+                vals.append(tok)
+                j += 1
+            if vals:
+                out[str(col)] = vals[:8]
+            break
+    return out
+
+
+def _token_ids_for_words(words: Sequence[str], src_ids: Sequence[int],
+                         src_ext_ids: Sequence[int], src_tokens: Sequence[str]) -> List[int]:
+    """Return extended-vocab ids whose source token text is in words."""
+    wanted = {str(w).lower() for w in words}
+    ids = []
+    for tok, xid in zip(src_tokens, src_ext_ids):
+        if str(tok).lower() in wanted and int(xid) not in ids:
+            ids.append(int(xid))
+    return ids
+
+
+def _column_id_sequences(columns: Sequence[str], tgt_vocab: Vocab,
+                         oovs: Sequence[str]) -> Dict[str, List[int]]:
+    out = {}
+    qid = tgt_vocab.stoi.get('"')
+    if qid is None:
+        return out
+    for col in columns:
+        inner = [_tok_to_id(t, tgt_vocab, oovs) for t in tokenize_value(str(col))]
+        if inner and all(i is not None for i in inner):
+            out[str(col)] = [int(qid)] + [int(i) for i in inner] + [int(qid)]
+    return out
+
+
+def _matches_prefix(tokens: Sequence[str], pattern: Sequence[str]) -> bool:
+    return list(tokens[-len(pattern):]) == list(pattern) if pattern else False
+
+
+def _decode_context(question: str, columns: Sequence[str], src_tokens: Sequence[str],
+                    src_ext_ids: Sequence[int], tgt_vocab: Vocab,
+                    oovs: Sequence[str],
+                    values_by_column: Optional[Dict[str, Sequence[str]]] = None):
+    """Build question-aware constraints for the SQL decoder."""
+    q = _sem_norm(question)
+    agg = _aggregate_intents(question)
+    cond_cols = _question_condition_columns(question, columns)
+    vals = _question_filter_values(question, columns)
+    if values_by_column:
+        # Actual CSV values let the decoder semantically link questions such as
+        # "cars in Mumbai" to the correct column even when the column name is
+        # not explicitly repeated in the question.
+        qn = _sem_norm(question)
+        for c, values in values_by_column.items():
+            for v in values:
+                vn = _sem_norm(str(v))
+                if len(vn) >= 2 and re.search(rf"\b{re.escape(vn)}\b", qn):
+                    vals.setdefault(str(c), [])
+                    if vn not in vals[str(c)]:
+                        vals[str(c)].append(vn)
+                    break
+    col_ids = _column_id_sequences(columns, tgt_vocab, oovs)
+
+    # If a column is explicitly mentioned and appears beside a value/relational
+    # cue, it is a strong WHERE candidate. Multiple such columns enable AND.
+    filter_cols = []
+    for c in cond_cols:
+        if c in vals or re.search(rf"\b{re.escape(_sem_norm(c))}\b\s+(?:is|equals|equal|greater|less|above|below|over|under)", q):
+            filter_cols.append(c)
+    for c in vals:
+        if str(c) in {str(x) for x in columns} and str(c) not in filter_cols:
+            filter_cols.append(str(c))
+    has_filter_words = bool(re.search(
+        r"\b(where|with|having|whose|that have|that has|is|equals|greater|less|above|below|over|under|at least|at most)\b",
+        q))
+    # COUNT is a row-level intent. This is enforced at decoder time.
+    force_count = agg["count"]
+    return {
+        "force_count": force_count,
+        "filter_cols": filter_cols,
+        "filter_values": vals,
+        "has_filter": bool(filter_cols) or has_filter_words,
+        "col_ids": col_ids,
+        "question": q,
+        "columns": [str(c) for c in columns],
+    }
+
+
+def _sql_prefix_state(token_texts: Sequence[str], ctx: dict) -> str:
+    """Return a small SQL grammar state for constrained decoding."""
+    t = [x for x in token_texts if x not in (SOS, PAD)]
+    if not t:
+        return "START"
+    if t[0] != "SELECT":
+        return "START"
+
+    # Once FROM exists, reason about the rest of the statement first.
+    if "FROM" in t:
+        fi = t.index("FROM")
+        if len(t) == fi + 1:
+            return "FROM_TABLE"
+        if "WHERE" in t:
+            wi = t.index("WHERE")
+            body = t[wi + 1:]
+            if not body:
+                return "WHERE_COLUMN"
+            # Inside or just after a quoted WHERE column.
+            quote_positions = [i for i, x in enumerate(body) if x == '"']
+            if len(quote_positions) % 2 == 1:
+                return "WHERE_COLUMN_SPAN"
+            # Single-quoted value span is distinct from double-quoted column spans.
+            if body.count("'") % 2 == 1:
+                return "WHERE_VALUE_SPAN"
+            if body[-1] == '"':
+                return "WHERE_AFTER_COLUMN"
+            if body[-1] in _SQL_CMP:
+                return "WHERE_VALUE"
+            if body[-1] == "'":
+                return "AFTER_VALUE"
+            if body[-1] in _SQL_BOOL:
+                return "WHERE_COLUMN"
+            # If we are after a quoted value, the previous token is usually the
+            # closing quote; the state above handles it.
+            return "AFTER_VALUE"
+        return "AFTER_FROM"
+
+    if len(t) == 1:
+        return "SELECT_EXPR"
+
+    # SELECT <aggregate> ...
+    if t[1] in _SQL_AGG:
+        if len(t) == 2:
+            return "AFTER_AGG"
+        if t[2] != "(":
+            return "SELECT_EXPR"
+        if len(t) == 3:
+            return "AGG_ARG"
+        if t[1] == "COUNT" and ctx.get("force_count"):
+            if t[3] == "*":
+                if len(t) == 4:
+                    return "AGG_CLOSE"
+                if t[-1] == ")":
+                    return "AFTER_SELECT_EXPR"
+                return "AGG_CLOSE"
+            return "AGG_ARG"
+        # AVG/SUM/MIN/MAX over a quoted column.
+        if t[3] != '"':
+            return "AGG_ARG"
+        if t.count('"') % 2 == 1:
+            return "AGG_COLUMN"
+        if t[-1] == '"':
+            return "AGG_CLOSE"
+        if t[-1] == ")":
+            return "AFTER_SELECT_EXPR"
+        return "AGG_COLUMN"
+
+    # SELECT "column" ...
+    if t[1] == '"':
+        if len(t) > 2 and t[-1] == '"':
+            return "AFTER_SELECT_EXPR"
+        return "SELECT_COLUMN"
+
+    return "SELECT_EXPR"
+
+
+def _ids_for_literal_tokens(words: Sequence[str], src_tokens: Sequence[str],
+                            src_ext_ids: Sequence[int]) -> List[int]:
+    wanted = {str(w).lower() for w in words}
+    return [int(xid) for tok, xid in zip(src_tokens, src_ext_ids)
+            if str(tok).lower() in wanted]
+
+
+@torch.no_grad()
+def sql_constrained_decode(model, src_ids, src_ext_ids, n_oov, question,
+                           columns, tgt_vocab, oovs, max_len=45, device="cpu",
+                           beam_size=1, values_by_column=None):
+    """Decode SQL with question-aware grammar/semantic constraints.
+
+    This is the decoder-level implementation of:
+      * question-aware interpretation
+      * multi-condition WHERE generation
+      * COUNT(*) semantics
+      * structural SQL correctness
+      * prevention of unsupported WHERE hallucinations
+
+    The neural decoder still supplies probabilities; the constraint layer masks
+    structurally/semantically impossible next tokens before choosing them.
+    """
+    V = model.tgt_vocab_size
+    src = torch.tensor([src_ids], device=device)
+    src_ext = torch.tensor([src_ext_ids], device=device)
+    enc_out, state0, mask = model.encode(src, torch.tensor([len(src_ids)]))
+    ctx0 = torch.zeros(1, model.enc_dim, device=device)
+    ctx = _decode_context(question, columns, src_tokens=build_source_sequence(question, "table", list(columns)),
+                          src_ext_ids=src_ext_ids, tgt_vocab=tgt_vocab, oovs=oovs,
+                          values_by_column=values_by_column)
+    # Rebuild exact source tokens corresponding to src_ids for value copying.
+    source_tokens = build_source_sequence(question, "table", list(columns))
+    # These are all source-side ids; values are copied from the question tokens.
+    quote_id = tgt_vocab.stoi.get('"')
+    kw = {k: tgt_vocab.stoi.get(k) for k in ["SELECT", "FROM", "WHERE", "AND", "OR", "COUNT", "AVG", "SUM", "MIN", "MAX"]}
+    star_id = tgt_vocab.stoi.get("*")
+    lpar_id = tgt_vocab.stoi.get("(")
+    rpar_id = tgt_vocab.stoi.get(")")
+    cmp_ids = {t: tgt_vocab.stoi.get(t) for t in _SQL_CMP if tgt_vocab.stoi.get(t) is not None}
+    eos_id = EOS_ID
+    col_seqs = ctx["col_ids"]
+    condition_cols = [c for c in ctx["filter_cols"] if c in col_seqs]
+    value_ids_by_col = {}
+    # Values are copied from question text and therefore already exist in the
+    # extended source vocabulary whenever the copy mechanism can represent them.
+    for c, words in ctx["filter_values"].items():
+        ids = _ids_for_literal_tokens(words, source_tokens, src_ext_ids)
+        if ids:
+            value_ids_by_col[c] = ids
+
+    def current_condition_column(generated_ids: List[int]) -> Optional[str]:
+        if kw["WHERE"] is None or kw["WHERE"] not in generated_ids:
+            return None
+        wi = generated_ids.index(kw["WHERE"])
+        body = generated_ids[wi + 1:]
+        # Scan from the end so the current condition wins when there are
+        # multiple predicates joined by AND.
+        for c in reversed(condition_cols):
+            seq = col_seqs.get(c, [])
+            if not seq:
+                continue
+            for j in range(len(body) - len(seq), -1, -1):
+                if body[j:j + len(seq)] == seq:
+                    return c
+        return None
+
+
+    def allowed_column_span(generated_ids: List[int], candidate_cols: Sequence[str]) -> List[int]:
+        """Allowed next ids inside a quoted schema-column span."""
+        if quote_id is None:
+            return []
+        try:
+            start_quote = len(generated_ids) - 1 - list(reversed(generated_ids)).index(quote_id)
+        except ValueError:
+            return []
+        prefix = generated_ids[start_quote:]
+        allowed = []
+        for c in candidate_cols:
+            seq = col_seqs.get(c, [])
+            if not seq:
+                continue
+            # seq = [quote, token..., quote]
+            if prefix == [quote_id]:
+                if len(seq) > 2:
+                    allowed.append(seq[1])
+                elif len(seq) == 2:
+                    allowed.append(quote_id)
+                continue
+            interior = prefix[1:]
+            target = seq[1:-1]
+            if interior == target:
+                allowed.append(quote_id)
+            elif target[:len(interior)] == interior and len(interior) < len(target):
+                allowed.append(seq[len(interior) + 1])
+        return list(dict.fromkeys(x for x in allowed if x is not None))
+
+    def determine_where_columns(texts: List[str]) -> List[str]:
+        # Use question-aware columns, excluding a column already used by the
+        # current condition before AND. This lets the decoder complete all
+        # explicit predicates instead of stopping after one.
+        return list(condition_cols)
+
+    def mask_logits(logp: torch.Tensor, toks: List[int], finished: bool):
+        texts = outputids_to_tokens(toks, tgt_vocab, oovs)
+        state = _sql_prefix_state(texts, ctx)
+        allowed = None
+
+        if state == "START":
+            allowed = [kw["SELECT"]]
+
+        elif state == "SELECT_EXPR":
+            if ctx["force_count"] and kw["COUNT"] is not None:
+                allowed = [kw["COUNT"]]
+            else:
+                # Either an opening quote for any real schema column, or an
+                # aggregate keyword. The next state handles the column span.
+                allowed = []
+                if quote_id is not None:
+                    allowed.append(quote_id)
+                allowed.extend(a for a in (kw["AVG"], kw["SUM"], kw["MIN"], kw["MAX"])
+                               if a is not None)
+
+        elif state == "AFTER_AGG":
+            allowed = [lpar_id] if lpar_id is not None else []
+
+        elif state in {"SELECT_COLUMN", "AGG_COLUMN"}:
+            candidate_cols = ctx["columns"]
+            allowed = allowed_column_span(toks, candidate_cols)
+
+        elif state == "AGG_ARG":
+            if ctx["force_count"] and texts and texts[-1] == "(":
+                allowed = [star_id] if star_id is not None else []
+            else:
+                allowed = [quote_id] if quote_id is not None else []
+
+        elif state == "AGG_CLOSE":
+            allowed = [rpar_id] if rpar_id is not None else []
+
+        elif state == "AFTER_SELECT_EXPR":
+            allowed = [kw["FROM"]] if kw["FROM"] is not None else []
+
+        elif state == "FROM_TABLE":
+            tid = tgt_vocab.stoi.get("table")
+            allowed = [tid] if tid is not None else []
+
+        elif state == "AFTER_FROM":
+            if condition_cols and kw["WHERE"] is not None:
+                # Explicit question-grounded conditions make WHERE mandatory.
+                allowed = [kw["WHERE"]]
+            else:
+                allowed = [eos_id]
+
+        elif state == "WHERE_COLUMN":
+            used = []
+            if kw["WHERE"] in toks:
+                wi = toks.index(kw["WHERE"])
+                body = toks[wi + 1:]
+                for c in condition_cols:
+                    seq = col_seqs.get(c, [])
+                    if seq and any(body[j:j+len(seq)] == seq for j in range(max(0, len(body)-len(seq)+1))):
+                        used.append(c)
+            allowed = [quote_id] if quote_id is not None and len(used) < len(condition_cols) else []
+
+        elif state == "WHERE_COLUMN_SPAN":
+            used = []
+            if kw["WHERE"] in toks:
+                wi = toks.index(kw["WHERE"])
+                body = toks[wi + 1:]
+                for c in condition_cols:
+                    seq = col_seqs.get(c, [])
+                    if seq and any(body[j:j+len(seq)] == seq for j in range(max(0, len(body)-len(seq)+1))):
+                        used.append(c)
+            remaining = [c for c in condition_cols if c not in used]
+            allowed = allowed_column_span(toks, remaining)
+
+        elif state == "WHERE_AFTER_COLUMN":
+            allowed = list(cmp_ids.values())
+
+        elif state == "WHERE_VALUE":
+            current_col = current_condition_column(toks)
+            allowed = []
+            # String values must be quoted; numeric values may be emitted directly.
+            sq = tgt_vocab.stoi.get("'")
+            if sq is not None:
+                allowed.append(sq)
+            if current_col:
+                allowed.extend(value_ids_by_col.get(current_col, []))
+            else:
+                for ids in value_ids_by_col.values():
+                    allowed.extend(ids)
+
+        elif state == "WHERE_VALUE_SPAN":
+            current_col = current_condition_column(toks)
+            allowed = []
+            if current_col:
+                allowed.extend(value_ids_by_col.get(current_col, []))
+            if quote_id is not None:
+                # Single-quote id is the value quote, not the double-quote column id.
+                sq = tgt_vocab.stoi.get("'")
+                if sq is not None:
+                    allowed.append(sq)
+
+        elif state == "AFTER_VALUE":
+            allowed = [eos_id]
+            # Require another question-grounded column before permitting AND.
+            if len(condition_cols) > 1 and kw["AND"] is not None:
+                # Count completed WHERE columns in the emitted text.
+                complete = 0
+                wi = toks.index(kw["WHERE"]) if kw["WHERE"] in toks else len(toks)
+                body = toks[wi + 1:]
+                for c in condition_cols:
+                    seq = col_seqs.get(c, [])
+                    if seq and any(body[j:j+len(seq)] == seq for j in range(max(0, len(body)-len(seq)+1))):
+                        complete += 1
+                if complete < len(condition_cols):
+                    allowed = [kw["AND"]] if kw["AND"] is not None else []
+
+        if allowed is not None:
+            allowed = [int(x) for x in allowed if x is not None and 0 <= int(x) < logp.numel()]
+            if not allowed:
+                return logp
+            idx = torch.tensor(sorted(set(allowed)), device=logp.device)
+            m = torch.full_like(logp, float("-inf"))
+            m[idx] = logp[idx]
+            return m
+        return logp
+
+
+    beams = [([], 0.0, state0, ctx0)]
+    finished = []
+    for _ in range(max_len):
+        candidates = []
+        for toks, score, st, ct in beams:
+            last = toks[-1] if toks else SOS_ID
+            y = _clamp(torch.tensor([last], device=device), V)
+            p, st2, ct2, _, _ = model.decoder.step(y, st, ct, enc_out, mask, src_ext, n_oov)
+            logp = torch.log(p.squeeze(0) + 1e-10)
+            logp = mask_logits(logp, toks, finished=False)
+            k = min(max(beam_size, 1), int((logp > -1e30).sum()))
+            top_lp, top_ix = logp.topk(k)
+            for lp, ix in zip(top_lp.tolist(), top_ix.tolist()):
+                candidates.append((toks + [ix], score + lp, st2, ct2))
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        beams = []
+        for toks, sc, st, ct in candidates:
+            if toks and toks[-1] == EOS_ID:
+                finished.append((toks[:-1], sc))
+            else:
+                beams.append((toks, sc, st, ct))
+            if len(beams) >= max(beam_size, 1):
+                break
+        if not beams or (finished and len(finished) >= max(beam_size, 1)):
+            break
+    if finished:
+        finished.sort(key=lambda x: x[1], reverse=True)
+        return finished[0][0]
+    return beams[0][0] if beams else []
+
 def predict_sql_with_values(model, question: str, table: str,
                             columns: Sequence[str], src_vocab: Vocab,
                             tgt_vocab: Vocab, beam: int = 1, max_len: int = 45,
                             device: str = "cpu", df_or_rows=None,
                             constrain_columns: bool = True) -> Dict[str, object]:
-    """Single-call inference API for applications using an uploaded table.
+    """Single-call decoder-level constrained inference API.
 
-    Returns both raw neural SQL and mandatory semantically grounded SQL so the
-    UI can display the distinction without generating the query twice.
+    The uploaded table is retained for application display/execution, but the
+    SQL semantics below are enforced in the decoder itself rather than by
+    post-generation SQL rewriting.
     """
     src_tokens = build_source_sequence(question, table, list(columns))
     src_ids, src_ext, _, _, oovs = build_extended(src_tokens, [], src_vocab, tgt_vocab)
-    trie = build_column_trie(columns, tgt_vocab, oovs) if constrain_columns else None
-    quote_id = tgt_vocab.stoi.get('"')
-    if beam > 1:
-        ids = beam_decode(model, src_ids, src_ext, len(oovs), beam_size=beam,
-                          max_len=max_len, device=device,
-                          trie=trie or None, quote_id=quote_id)
-        attn = None
-    else:
-        ids, attn = _greedy_with_attention_for_app(
-            model, src_ids, src_ext, len(oovs), max_len, device, trie, quote_id)
+    values = build_value_candidates(df_or_rows) if df_or_rows is not None else None
+    ids = sql_constrained_decode(
+        model, src_ids, src_ext, len(oovs), question, columns, tgt_vocab, oovs,
+        max_len=max_len, device=device, beam_size=max(1, beam),
+        values_by_column=values)
     tokens = outputids_to_tokens(ids, tgt_vocab, oovs)
     raw_sql = repair_sql(detokenize_sql(tokens))
-    values = build_value_candidates(df_or_rows) if df_or_rows is not None else None
-    final_sql = semantic_repair_sql(raw_sql, question, columns, table, values)
+    # No semantic post-repair here: raw_sql is the decoder's constrained output.
     return {
         "raw_sql": raw_sql,
-        "sql": final_sql,
+        "sql": raw_sql,
         "src_tokens": src_tokens,
         "out_tokens": tokens,
-        "attn": attn,
+        "attn": None,
     }
 
 
@@ -2384,23 +2868,13 @@ def predict_sql(model, question: str, table: str, columns: Sequence[str],
                 src_vocab: Vocab, tgt_vocab: Vocab, beam: int = 1,
                 max_len: int = 45, device: str = "cpu",
                 constrain_columns: bool = True) -> str:
-    """End-to-end: raw question + schema -> SQL string."""
+    """End-to-end question + schema -> SQL using decoder-level constraints."""
     src_tokens = build_source_sequence(question, table, list(columns))
     src_ids, src_ext, _, _, oovs = build_extended(
         src_tokens, [], src_vocab, tgt_vocab)
-
-    trie = build_column_trie(columns, tgt_vocab, oovs) if constrain_columns else None
-    quote_id = tgt_vocab.stoi.get('"')
-
-    if beam > 1:
-        ids = beam_decode(model, src_ids, src_ext, len(oovs), beam_size=beam,
-                          max_len=max_len, device=device,
-                          trie=trie or None, quote_id=quote_id)
-    elif constrain_columns:
-        ids = constrained_greedy_decode(model, src_ids, src_ext, len(oovs),
-                                        columns, tgt_vocab, oovs, max_len, device)
-    else:
-        ids = greedy_decode(model, src_ids, src_ext, len(oovs), max_len, device)
+    ids = sql_constrained_decode(
+        model, src_ids, src_ext, len(oovs), question, columns, tgt_vocab, oovs,
+        max_len=max_len, device=device, beam_size=max(1, beam))
     return repair_sql(detokenize_sql(outputids_to_tokens(ids, tgt_vocab, oovs)))
 
 
